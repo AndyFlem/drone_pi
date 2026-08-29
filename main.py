@@ -19,23 +19,29 @@ from machine import UART, Pin
 
 import config
 from mavlink_min import FrameReader, build_heartbeat, build_set_message_interval, decode
-from util import MonotonicUs
+from util import WallClock
 from sdlog import TlogWriter
 from oled_status import StatusDisplay
 
 
 def _translate(msgid, fields):
-    # HEARTBEAT / SYS_STATUS / GPS_RAW_INT / GLOBAL_POSITION_INT / VFR_HUD -> StatusDisplay kwargs
+    # HEARTBEAT / SYS_STATUS / GPS_RAW_INT / VFR_HUD / RC_CHANNELS / STATUSTEXT -> StatusDisplay kwargs
     if msgid == 0:
-        return {"mode": fields["mode"], "armed": fields["armed"]}
+        return {"mode": fields["mode"]}
     if msgid == 1:
-        return {"voltage_v": fields["voltage_v"]}
+        return {"voltage_v": fields["voltage_v"], "battery_pct": fields["battery_pct"],
+                "armable": fields["armable"]}
     if msgid == 24:
         return {"fix_type": fields["fix_type"], "satellites": fields["satellites"]}
-    if msgid == 33:
-        return {"alt_m": fields["rel_alt_m"]}
     if msgid == 74:
         return {"heading_deg": fields["heading_deg"]}
+    if msgid == 65:
+        rssi = fields["rssi"]
+        return {"rssi_pct": None if rssi == 255 else rssi * 100 // 254}
+    if msgid == 253:
+        text = fields["text"].lower()
+        if "radio failsafe" in text:
+            return {"rc_ok": "clear" in text}
     return {}
 
 
@@ -51,6 +57,7 @@ def _init_stage(label, fn):
 
 
 def main():
+    boot_ms = time.ticks_ms()
     print("=== telemetry logger booting ===")
 
     uart = _init_stage(
@@ -59,7 +66,7 @@ def main():
                       tx=Pin(config.UART_TX_PIN), rx=Pin(config.UART_RX_PIN)),
     )
     reader = FrameReader(uart)
-    clock = MonotonicUs()
+    clock = WallClock()
 
     print("[init] sd card + tlog ...")
     try:
@@ -105,6 +112,11 @@ def main():
             msgid_counts[msgid] = msgid_counts.get(msgid, 0) + 1
             if msgid == 0:
                 fc_sysid, fc_compid = frame[5], frame[6]
+            if msgid == 2 and fields and fields["time_unix_usec"]:
+                was_synced = clock.synced
+                clock.sync(fields["time_unix_usec"])
+                if not was_synced:
+                    print("[time] GPS-derived UNIX time now available -- log timestamps synced")
             if fields:
                 print("[mavlink] msgid=%d %s" % (msgid, fields))
                 display.update(**_translate(msgid, fields))
@@ -127,7 +139,7 @@ def main():
             last_request = now
 
         if time.ticks_diff(now, last_oled) >= config.OLED_UPDATE_INTERVAL_MS:
-            display.update(frames=frame_count)
+            display.update(frames=frame_count, uptime_s=time.ticks_diff(now, boot_ms) // 1000)
             display.render()
             last_oled = now
 

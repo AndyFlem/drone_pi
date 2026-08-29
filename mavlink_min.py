@@ -30,6 +30,12 @@ _MAX_PLAUSIBLE_MSGID = 16383
 _HEARTBEAT_CRC_EXTRA = 50
 _COMMAND_LONG_CRC_EXTRA = 152
 
+# MAV_SYS_STATUS_SENSOR.MAV_SYS_STATUS_PREARM_CHECK -- ArduPilot reports its
+# prearm-check result as a bit in SYS_STATUS's health field (set = armable),
+# but only sets the matching bit in the present field on versions that
+# actually support this, so present must be checked too.
+_MAV_SYS_STATUS_PREARM_CHECK = 0x10000000
+
 MAV_CMD_SET_MESSAGE_INTERVAL = 511
 
 ARDUCOPTER_MODES = {
@@ -161,17 +167,28 @@ def decode(frame):
         p = _pad(payload, 9)
         custom_mode, mtype, autopilot, base_mode, status = struct.unpack("<IBBBB", p[:8])
         return msgid, {
-            "armed": bool(base_mode & 0x80),
             "mode": ARDUCOPTER_MODES.get(custom_mode, str(custom_mode)),
         }
 
+    if msgid == 2:  # SYSTEM_TIME -- time_unix_usec is 0 until the FC has a
+        # real time source (derived from the GPS fix); nonzero from then on.
+        p = _pad(payload, 12)
+        time_unix_usec, = struct.unpack_from("<Q", p, 0)
+        return msgid, {"time_unix_usec": time_unix_usec}
+
     if msgid == 1:  # SYS_STATUS
         p = _pad(payload, 31)
+        present, _enabled, health = struct.unpack_from("<III", p, 0)
         voltage_mv = struct.unpack_from("<H", p, 14)[0]
         battery_remaining = struct.unpack_from("<b", p, 30)[0]
+        if present & _MAV_SYS_STATUS_PREARM_CHECK:
+            armable = bool(health & _MAV_SYS_STATUS_PREARM_CHECK)
+        else:
+            armable = None  # FC doesn't report prearm status this way
         return msgid, {
             "voltage_v": voltage_mv / 1000.0,
             "battery_pct": battery_remaining,
+            "armable": armable,
         }
 
     if msgid == 24:  # GPS_RAW_INT
@@ -182,15 +199,27 @@ def decode(frame):
             "satellites": sats,
         }
 
-    if msgid == 33:  # GLOBAL_POSITION_INT
-        p = _pad(payload, 28)
-        rel_alt_mm, = struct.unpack_from("<i", p, 16)
-        return msgid, {"rel_alt_m": rel_alt_mm / 1000.0}
-
     if msgid == 74:  # VFR_HUD -- EKF-fused mag heading
         p = _pad(payload, 20)
         heading, = struct.unpack_from("<h", p, 16)
         return msgid, {"heading_deg": heading}
+
+    if msgid == 65:  # RC_CHANNELS -- rssi is the RC link's own quality
+        # reading (ELRS reports it via CRSF telemetry into this field),
+        # scaled 0-254; 255 means "unknown/invalid". Some receiver/RSSI_TYPE
+        # combinations never actually update this byte, so it can't be
+        # trusted alone to notice a lost transmitter -- see STATUSTEXT (253).
+        p = _pad(payload, 42)
+        rssi, = struct.unpack_from("<B", p, 41)
+        return msgid, {"rssi": rssi}
+
+    if msgid == 253:  # STATUSTEXT -- ArduPilot emits "PreArm: Radio
+        # failsafe on" / "...cleared" the instant the RC link state
+        # changes, which is a reliable way to notice a lost transmitter
+        # when RC_CHANNELS.rssi itself won't move.
+        p = _pad(payload, 51)
+        text = bytes(p[1:51]).split(b"\x00", 1)[0].decode()
+        return msgid, {"text": text}
 
     if msgid == 27:  # RAW_IMU -- xmag/ymag/zmag is the external compass
         # (QMC5883L on the GPS module) in milligauss, raw/uncalibrated.

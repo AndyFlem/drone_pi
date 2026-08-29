@@ -26,11 +26,17 @@ STATS_PRINT_INTERVAL_MS = 2000
 
 # Messages requested explicitly via MAV_CMD_SET_MESSAGE_INTERVAL, since this
 # port has no SRx_* stream-rate group of its own (see mavlink_min.
-# build_set_message_interval). Only msgid=0/1/24/33 are decoded for the OLED
-# (main._translate) -- everything else here is requested purely so the raw
-# bytes land in the .tlog for post-flight analysis; rate chosen per message's
-# role (attitude/RC faster, slow-changing power/pressure data slower).
+# build_set_message_interval). msgid=0/1/24/65/74 are decoded for the OLED
+# (main._translate) and msgid=2 for wall-clock sync (main.main, util.
+# WallClock) -- everything else here is requested purely so the raw bytes
+# land in the .tlog for post-flight analysis; rate chosen per message's role
+# (attitude/RC faster, slow-changing power/pressure data slower).
+#
+# STATUSTEXT (253) is also decoded for the OLED (RC failsafe detection) but
+# is deliberately not listed here -- it's event-driven and ArduPilot sends
+# it unprompted whenever there's something to report, not on a stream rate.
 REQUESTED_MSG_INTERVALS_US = {
+    2: 1_000_000,    # SYSTEM_TIME        1 Hz  GPS-derived UNIX time for log timestamps
     1: 500_000,      # SYS_STATUS         2 Hz  battery, sensor health flags
     24: 500_000,     # GPS_RAW_INT        2 Hz  raw GPS fix/sats/alt
     33: 200_000,     # GLOBAL_POSITION_INT 5 Hz  fused position/altitude
@@ -40,6 +46,7 @@ REQUESTED_MSG_INTERVALS_US = {
     36: 200_000,     # SERVO_OUTPUT_RAW   5 Hz  actual motor/servo PWM outputs
     27: 200_000,     # RAW_IMU            5 Hz  accel/gyro/mag
     29: 500_000,     # SCALED_PRESSURE    2 Hz  baro pressure/temp
+    241: 500_000,    # VIBRATION          2 Hz  vibe_x/y/z + accel clipping counters
     125: 1_000_000,  # POWER_STATUS       1 Hz  Vcc/servo-rail voltage, brownout flags
     291: 200_000,    # ESC_STATUS         5 Hz  per-motor RPM/voltage/current (modern dialect)
     290: 1_000_000,  # ESC_INFO           1 Hz  per-motor temp/error count (modern dialect)

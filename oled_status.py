@@ -1,5 +1,5 @@
-# oled_status.py -- 128x64 SSD1306 status screen: mode/armed, GPS fix, battery
-# voltage, altitude, and SD logging status.
+# oled_status.py -- 128x64 SSD1306 status screen: mode/armable, GPS fix,
+# battery voltage, uptime/RSSI, and SD logging status.
 
 from machine import I2C, Pin
 
@@ -13,11 +13,11 @@ class StatusDisplay:
         i2c = I2C(i2c_id, sda=Pin(sda), scl=Pin(scl), freq=400_000)
         self.oled = ssd1306.SSD1306_I2C(width, height, i2c, addr=addr)
         self.state = {
-            "mode": "?", "armed": False,
+            "mode": "?", "armable": None,
             "fix_type": 0, "satellites": 0,
-            "voltage_v": 0.0, "alt_m": 0.0,
+            "voltage_v": 0.0, "battery_pct": -1, "uptime_s": 0,
             "log_path": "-", "frames": 0,
-            "heading_deg": 0,
+            "heading_deg": 0, "rssi_pct": None, "rc_ok": None,
         }
         self._blink = False
 
@@ -37,9 +37,14 @@ class StatusDisplay:
         o.fill(0)
 
         mode_text = _MODE_LABEL.get(s["mode"], s["mode"])[:12]
-        armed_text = "ARM" if s["armed"] else "DIS"
+        if s["armable"] is True:
+            armable_text = "RDY"
+        elif s["armable"] is False:
+            armable_text = "BAD"
+        else:
+            armable_text = "?"
         o.text(mode_text, 0, 0)
-        o.text(armed_text, 128 - len(armed_text) * 8, 0)
+        o.text(armable_text, 128 - len(armable_text) * 8, 0)
 
         if s["fix_type"] < 2:
             gps_text = "No-fix"
@@ -51,8 +56,19 @@ class StatusDisplay:
         heading_text = "%03d" % (s["heading_deg"] % 360)
         o.text(heading_text, 128 - len(heading_text) * 8, 16)
 
-        o.text("Batt: %.2fV" % s["voltage_v"], 0, 28)
-        o.text("Alt: %.1fm" % s["alt_m"], 0, 40)
+        pct_text = "%d%%" % s["battery_pct"] if s["battery_pct"] >= 0 else "?%"
+        o.text("Batt:%.1fV %s" % (s["voltage_v"], pct_text), 0, 28)
+        uptime_text = "%02d:%02d" % (s["uptime_s"] // 60, s["uptime_s"] % 60)
+        if s["rc_ok"] is False:
+            # ArduPilot doesn't reset RC_CHANNELS.rssi on failsafe -- it just
+            # stops updating, so a stale reading would otherwise linger here.
+            rssi_text = "RSSI:LOST"
+        elif s["rssi_pct"] is not None:
+            rssi_text = "RSSI:%d%%" % s["rssi_pct"]
+        else:
+            rssi_text = "RSSI:--"
+        o.text(uptime_text, 0, 40)
+        o.text(rssi_text, 128 - len(rssi_text) * 8, 40)
 
         if s["log_path"] in (None, "no SD"):
             sd_text = "No SD"
