@@ -201,7 +201,7 @@ Battery is the dominant single mass (~52% of AUW). The balance is the frame, scr
 
 # 5. Telemetry Logging Subsystem
 
-Independent, removable telemetry logger tapping the FC's MAVLink stream. Complements (does not replace) the FC's onboard 512 MB `.bin` dataflash logging. The FC streams MAVLink2 out **UART3 (TX3/RX3)**; the Pico logs it to microSD (recommended: QGC-compatible `.tlog` format) and drives a 0.96" OLED for live status. The "W" also allows an optional WiFi telemetry re-broadcast to a phone/tablet GCS.
+Independent, removable telemetry logger tapping the FC's MAVLink stream. Complements (does not replace) the FC's onboard 512 MB `.bin` dataflash logging. The FC streams MAVLink2 out **UART3 (TX3/RX3)**; the Pico logs it to microSD (recommended: QGC-compatible `.tlog` format), drives a 0.96" OLED for live status, and rebroadcasts the stream over its onboard WiFi (AP mode, UDP :14550) to a phone/tablet GCS.
 
 ## Parts
 - **Raspberry Pi Pico 2 W** (RP2350, 3.3 V logic, WiFi) — ~7 g
@@ -250,7 +250,20 @@ Independent, removable telemetry logger tapping the FC's MAVLink stream. Complem
 - Write **`.tlog`**: per packet = 8-byte big-endian µs timestamp (`time_us_64()`) + raw bytes → opens directly in MAVExplorer / QGroundControl / pymavlink (no custom decoder).
 - Buffer in RAM, `f_sync` every 1–2 s (power-loss safety; optional supercap).
 - OLED: show live GPS fix/sats, battery V, alt, mode, log status.
-- Optional WiFi AP → re-serve MAVLink over TCP/UDP to a GCS.
+- WiFi AP + UDP MAVLink bridge (`wifi_telem.py`): Pico hosts its own access
+  point (SSID/password in `config.py`, default IP 192.168.4.1) and relays
+  every FC frame to the AP subnet broadcast address on UDP :14550 as it's
+  read, so QGroundControl's UDP auto-connect (which listens passively and
+  adopts whichever sender it first hears from) picks it up with no
+  handshake. GCS-originated UDP datagrams on the same port are forwarded
+  byte-for-byte back to the FC over UART, so it's a bidirectional bridge
+  (telemetry out, commands/params in) — not just one-way re-broadcast.
+- Debug/flight-event log (`pico_log.py` + `sdlog.TextLogWriter`): every REPL
+  debug line (init progress, wifi/AP status) plus flight-summary events
+  (mode changes, PreArm failures, ready-to-arm, armed/disarmed, a
+  position+attitude line every 5 s) also get appended to a plaintext
+  `logNNNN.txt` alongside the matching `logNNNN.tlog` on the SD card, when
+  the card is available.
 - MicroPython is sufficient at telemetry rates; C/Pico-SDK + FatFs only if pushing very high rates.
 - SD init note: the mini adapter has no card-detect; SPI clock init low (~400 kHz) then raise to ~12–25 MHz after mount. Keep SPI wires short — bare adapters aren't great at high clock over long leads.
 

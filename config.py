@@ -22,7 +22,8 @@ OLED_ADDR = 0x3C  # try 0x3D if the screen stays blank
 SD_SYNC_INTERVAL_MS = 1500
 OLED_UPDATE_INTERVAL_MS = 400
 HEARTBEAT_INTERVAL_MS = 1000
-STATS_PRINT_INTERVAL_MS = 2000
+STATION_CHECK_INTERVAL_MS = 2000  # how often to poll for AP client connect/disconnect
+FLIGHT_SUMMARY_INTERVAL_MS = 5000  # how often to log a position/attitude summary line
 
 # Messages requested explicitly via MAV_CMD_SET_MESSAGE_INTERVAL, since this
 # port has no SRx_* stream-rate group of its own (see mavlink_min.
@@ -53,3 +54,21 @@ REQUESTED_MSG_INTERVALS_US = {
     11030: 200_000,  # ESC_TELEMETRY_1_TO_4  5 Hz  ArduPilot-dialect fallback for older firmware
 }
 STATUS_REQUEST_INTERVAL_MS = 5000  # resend periodically in case a request is dropped
+
+# Message IDs NOT relayed over the WiFi/UDP GCS link -- the high-rate
+# messages above that are requested purely for .tlog post-flight analysis
+# (RAW_IMU, SERVO_OUTPUT_RAW, VIBRATION, SCALED_PRESSURE, POWER_STATUS,
+# ESC_STATUS, ESC_INFO, ESC_TELEMETRY_1_TO_4). A GCS doesn't need these
+# live, and forwarding all of them was saturating the wifi link badly
+# enough to make Mission Planner's initial parameter download take ~60s.
+# The .tlog still gets every frame unfiltered; this only trims the wifi
+# relay. Messages outside REQUESTED_MSG_INTERVALS_US entirely (PARAM_VALUE,
+# COMMAND_ACK, MISSION_*, etc.) are FC-response traffic, not part of this
+# stream-rate set, and are always relayed.
+WIFI_EXCLUDE_MSGIDS = {27, 36, 241, 29, 125, 291, 290, 11030}
+
+# WiFi AP + UDP MAVLink bridge to GCS (Pico 2 W onboard radio). Customize
+# SSID/password before flying -- these are placeholders.
+AP_SSID = "DronePico"
+AP_PASSWORD = "dronetelem"  # WPA2-PSK; MicroPython requires >= 8 chars
+GCS_UDP_PORT = 14550

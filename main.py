@@ -20,8 +20,10 @@ from machine import UART, Pin
 import config
 from mavlink_min import FrameReader, build_heartbeat, build_set_message_interval, decode
 from util import WallClock
-from sdlog import TlogWriter
+from sdlog import TlogWriter, TextLogWriter
 from oled_status import StatusDisplay
+from wifi_telem import TelemetryLink
+from pico_log import log, attach as attach_text_log, attach_clock
 
 
 def _translate(msgid, fields):
@@ -45,40 +47,63 @@ def _translate(msgid, fields):
     return {}
 
 
+def _battery_text(battery):
+    if battery is None:
+        return None
+    pct = "%d%%" % battery["battery_pct"] if battery["battery_pct"] >= 0 else "?%"
+    return "batt=%.1fV %s" % (battery["voltage_v"], pct)
+
+
 def _init_stage(label, fn):
-    print("[init] %s ..." % label)
+    log("[init] %s ..." % label)
     try:
         result = fn()
     except Exception as e:
-        print("[init] %s FAILED: %r" % (label, e))
+        log("[init] %s FAILED: %r" % (label, e))
         raise
-    print("[init] %s OK" % label)
+    log("[init] %s OK" % label)
     return result
 
 
 def main():
     boot_ms = time.ticks_ms()
-    print("=== telemetry logger booting ===")
+    log("=== telemetry logger booting ===")
 
     uart = _init_stage(
         "uart0 (mavlink)",
         lambda: UART(config.UART_ID, baudrate=config.UART_BAUD,
-                      tx=Pin(config.UART_TX_PIN), rx=Pin(config.UART_RX_PIN)),
+                      tx=Pin(config.UART_TX_PIN), rx=Pin(config.UART_RX_PIN),
+                      rxbuf=1024),
     )
     reader = FrameReader(uart)
     clock = WallClock()
+    attach_clock(clock)
 
-    print("[init] sd card + tlog ...")
+    link = _init_stage(
+        "wifi ap + udp bridge",
+        lambda: TelemetryLink(config.AP_SSID, config.AP_PASSWORD, config.GCS_UDP_PORT),
+    )
+
+    log("[init] sd card + tlog ...")
     try:
         tlog = TlogWriter(config.SPI_ID, config.SPI_SCK_PIN, config.SPI_MOSI_PIN,
                            config.SPI_MISO_PIN, config.SD_CS_PIN,
                            sync_interval_ms=config.SD_SYNC_INTERVAL_MS)
         log_path = tlog.path
-        print("[init] sd card + tlog OK -- logging to %s" % log_path)
+        log("[init] sd card + tlog OK -- logging to %s" % log_path)
+        try:
+            text_log = TextLogWriter(tlog.mount_point, tlog.session_id,
+                                      sync_interval_ms=config.SD_SYNC_INTERVAL_MS)
+            attach_text_log(text_log)
+            log("[init] text log OK -- logging to %s" % text_log.path)
+        except Exception as e:
+            # Debug/flight-event log is a nice-to-have alongside the .tlog --
+            # its absence shouldn't take down telemetry logging either.
+            log("[init] text log FAILED: %r -- REPL-only debug output" % e)
     except Exception as e:
         # SD card/adapter not wired in yet (or faulty) -- keep flying blind on
         # logging rather than bricking the OLED status readout over it.
-        print("[init] sd card + tlog FAILED: %r -- continuing without SD logging" % e)
+        log("[init] sd card + tlog FAILED: %r -- continuing without SD logging" % e)
         tlog = None
         log_path = "no SD"
 
@@ -89,17 +114,23 @@ def main():
     )
     display.update(log_path=log_path)
 
-    print("=== entering main loop ===")
+    log("=== entering main loop ===")
 
     frame_count = 0
-    msgid_counts = {}
     heartbeat_seq = 0
     request_seq = 0
     fc_sysid = None
     fc_compid = None
+    last_mode = None
+    last_armed = None
+    last_armable = None
+    last_position = None
+    last_attitude = None
+    last_battery = None
     last_heartbeat = time.ticks_ms()
     last_oled = time.ticks_ms()
-    last_stats = time.ticks_ms()
+    last_stations = time.ticks_ms()
+    last_summary = time.ticks_ms()
     last_request = 0  # force an immediate request as soon as we know the FC's ids
 
     while True:
@@ -109,23 +140,49 @@ def main():
             frame_count += 1
 
             msgid, fields = decode(frame)
-            msgid_counts[msgid] = msgid_counts.get(msgid, 0) + 1
+            if msgid not in config.WIFI_EXCLUDE_MSGIDS:
+                link.send(frame)
             if msgid == 0:
                 fc_sysid, fc_compid = frame[5], frame[6]
             if msgid == 2 and fields and fields["time_unix_usec"]:
                 was_synced = clock.synced
                 clock.sync(fields["time_unix_usec"])
                 if not was_synced:
-                    print("[time] GPS-derived UNIX time now available -- log timestamps synced")
+                    log("[time] GPS-derived UNIX time now available -- log timestamps synced")
             if fields:
-                print("[mavlink] msgid=%d %s" % (msgid, fields))
                 display.update(**_translate(msgid, fields))
+
+                if msgid == 0:
+                    mode = fields["mode"]
+                    if mode != last_mode:
+                        log("[flight] mode: %s -> %s" % (last_mode, mode))
+                        last_mode = mode
+                    armed = fields["armed"]
+                    if armed != last_armed:
+                        batt = _battery_text(last_battery)
+                        log("[flight] %s%s" % ("ARMED" if armed else "DISARMED",
+                                                " (%s)" % batt if batt else ""))
+                        last_armed = armed
+                elif msgid == 1:
+                    last_battery = fields
+                    armable = fields["armable"]
+                    if armable is not None and armable != last_armable:
+                        log("[flight] %s" % ("READY TO ARM" if armable else "NOT READY TO ARM"))
+                        last_armable = armable
+                elif msgid == 253 and "prearm" in fields["text"].lower():
+                    log("[flight] %s" % fields["text"])
+                elif msgid == 33:
+                    last_position = fields
+                elif msgid == 30:
+                    last_attitude = fields
+
+        for cmd in link.poll_commands():
+            uart.write(cmd)
 
         now = time.ticks_ms()
 
         if time.ticks_diff(now, last_heartbeat) >= config.HEARTBEAT_INTERVAL_MS:
             uart.write(build_heartbeat(heartbeat_seq))
-            print("[heartbeat] sent seq=%d" % heartbeat_seq)
             heartbeat_seq = (heartbeat_seq + 1) & 0xFF
             last_heartbeat = now
 
@@ -134,8 +191,6 @@ def main():
                 uart.write(build_set_message_interval(
                     request_seq, fc_sysid, fc_compid, wanted_id, interval_us))
                 request_seq = (request_seq + 1) & 0xFF
-            print("[request] asked sys=%d comp=%d for %d msgids" % (
-                fc_sysid, fc_compid, len(config.REQUESTED_MSG_INTERVALS_US)))
             last_request = now
 
         if time.ticks_diff(now, last_oled) >= config.OLED_UPDATE_INTERVAL_MS:
@@ -143,10 +198,20 @@ def main():
             display.render()
             last_oled = now
 
-        if time.ticks_diff(now, last_stats) >= config.STATS_PRINT_INTERVAL_MS:
-            print("[stats] frames=%d resyncs=%d by_msgid=%s" % (
-                frame_count, reader.resync_count, msgid_counts))
-            last_stats = now
+        if time.ticks_diff(now, last_stations) >= config.STATION_CHECK_INTERVAL_MS:
+            link.check_stations()
+            last_stations = now
+
+        if time.ticks_diff(now, last_summary) >= config.FLIGHT_SUMMARY_INTERVAL_MS:
+            if last_position is not None and last_attitude is not None:
+                hdg = last_position["hdg_deg"]
+                batt = _battery_text(last_battery)
+                log("[flight] %spos lat=%.6f lon=%.6f alt=%.1fm hdg=%s | att roll=%.1f pitch=%.1f yaw=%.1f" % (
+                    (batt + " | ") if batt else "",
+                    last_position["lat_deg"], last_position["lon_deg"], last_position["rel_alt_m"],
+                    "%.0f" % hdg if hdg is not None else "?",
+                    last_attitude["roll_deg"], last_attitude["pitch_deg"], last_attitude["yaw_deg"]))
+            last_summary = now
 
 
 if __name__ == "__main__":

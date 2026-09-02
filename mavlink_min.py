@@ -1,12 +1,14 @@
 # mavlink_min.py -- minimal MAVLink2 framing for the telemetry logger.
 #
 # Scope is deliberately narrow: reassemble raw frames off the UART for .tlog
-# logging, decode the handful of fields the OLED needs, and build an outgoing
-# HEARTBEAT so the FC starts/keeps streaming (dronespec.md Sec.5 notes this
-# helps ArduPilot begin sending). We do not validate incoming checksums --
-# QGroundControl/MAVExplorer will do that when the .tlog is replayed.
+# logging, decode the handful of fields the OLED/flight-event log needs, and
+# build an outgoing HEARTBEAT so the FC starts/keeps streaming (dronespec.md
+# Sec.5 notes this helps ArduPilot begin sending). We do not validate
+# incoming checksums -- QGroundControl/MAVExplorer will do that when the
+# .tlog is replayed.
 
 import ustruct as struct
+import math
 
 MAVLINK2_STX = 0xFD
 _HEADER_LEN = 10  # STX, len, incompat, compat, seq, sysid, compid, msgid(3)
@@ -35,6 +37,10 @@ _COMMAND_LONG_CRC_EXTRA = 152
 # but only sets the matching bit in the present field on versions that
 # actually support this, so present must be checked too.
 _MAV_SYS_STATUS_PREARM_CHECK = 0x10000000
+
+# MAV_MODE_FLAG.MAV_MODE_FLAG_SAFETY_ARMED -- HEARTBEAT.base_mode bit set
+# whenever the vehicle is armed, regardless of flight mode or autopilot.
+_MAV_MODE_FLAG_SAFETY_ARMED = 0x80
 
 MAV_CMD_SET_MESSAGE_INTERVAL = 511
 
@@ -163,70 +169,100 @@ def decode(frame):
     msgid = frame[7] | (frame[8] << 8) | (frame[9] << 16)
     payload = frame[10:10 + frame[1]]
 
-    if msgid == 0:  # HEARTBEAT
-        p = _pad(payload, 9)
-        custom_mode, mtype, autopilot, base_mode, status = struct.unpack("<IBBBB", p[:8])
-        return msgid, {
-            "mode": ARDUCOPTER_MODES.get(custom_mode, str(custom_mode)),
-        }
+    # Frames aren't CRC-validated (see module docstring), so a false resync
+    # can hand us a header that looks plausible but whose payload is garbage
+    # (e.g. non-UTF8 bytes where STATUSTEXT expects text). Decoding is
+    # inherently best-effort -- any failure here just means "nothing to
+    # report" for this frame, not a reason to crash the logger.
+    try:
+        if msgid == 0:  # HEARTBEAT
+            p = _pad(payload, 9)
+            custom_mode, mtype, autopilot, base_mode, status = struct.unpack("<IBBBB", p[:8])
+            return msgid, {
+                "mode": ARDUCOPTER_MODES.get(custom_mode, str(custom_mode)),
+                "armed": bool(base_mode & _MAV_MODE_FLAG_SAFETY_ARMED),
+            }
 
-    if msgid == 2:  # SYSTEM_TIME -- time_unix_usec is 0 until the FC has a
-        # real time source (derived from the GPS fix); nonzero from then on.
-        p = _pad(payload, 12)
-        time_unix_usec, = struct.unpack_from("<Q", p, 0)
-        return msgid, {"time_unix_usec": time_unix_usec}
+        if msgid == 2:  # SYSTEM_TIME -- time_unix_usec is 0 until the FC has a
+            # real time source (derived from the GPS fix); nonzero from then on.
+            p = _pad(payload, 12)
+            time_unix_usec, = struct.unpack_from("<Q", p, 0)
+            return msgid, {"time_unix_usec": time_unix_usec}
 
-    if msgid == 1:  # SYS_STATUS
-        p = _pad(payload, 31)
-        present, _enabled, health = struct.unpack_from("<III", p, 0)
-        voltage_mv = struct.unpack_from("<H", p, 14)[0]
-        battery_remaining = struct.unpack_from("<b", p, 30)[0]
-        if present & _MAV_SYS_STATUS_PREARM_CHECK:
-            armable = bool(health & _MAV_SYS_STATUS_PREARM_CHECK)
-        else:
-            armable = None  # FC doesn't report prearm status this way
-        return msgid, {
-            "voltage_v": voltage_mv / 1000.0,
-            "battery_pct": battery_remaining,
-            "armable": armable,
-        }
+        if msgid == 1:  # SYS_STATUS
+            p = _pad(payload, 31)
+            present, _enabled, health = struct.unpack_from("<III", p, 0)
+            voltage_mv = struct.unpack_from("<H", p, 14)[0]
+            battery_remaining = struct.unpack_from("<b", p, 30)[0]
+            if present & _MAV_SYS_STATUS_PREARM_CHECK:
+                armable = bool(health & _MAV_SYS_STATUS_PREARM_CHECK)
+            else:
+                armable = None  # FC doesn't report prearm status this way
+            return msgid, {
+                "voltage_v": voltage_mv / 1000.0,
+                "battery_pct": battery_remaining,
+                "armable": armable,
+            }
 
-    if msgid == 24:  # GPS_RAW_INT
-        p = _pad(payload, 30)
-        fix_type, sats = struct.unpack_from("<BB", p, 28)
-        return msgid, {
-            "fix_type": fix_type,
-            "satellites": sats,
-        }
+        if msgid == 24:  # GPS_RAW_INT
+            p = _pad(payload, 30)
+            fix_type, sats = struct.unpack_from("<BB", p, 28)
+            return msgid, {
+                "fix_type": fix_type,
+                "satellites": sats,
+            }
 
-    if msgid == 74:  # VFR_HUD -- EKF-fused mag heading
-        p = _pad(payload, 20)
-        heading, = struct.unpack_from("<h", p, 16)
-        return msgid, {"heading_deg": heading}
+        if msgid == 74:  # VFR_HUD -- EKF-fused mag heading
+            p = _pad(payload, 20)
+            heading, = struct.unpack_from("<h", p, 16)
+            return msgid, {"heading_deg": heading}
 
-    if msgid == 65:  # RC_CHANNELS -- rssi is the RC link's own quality
-        # reading (ELRS reports it via CRSF telemetry into this field),
-        # scaled 0-254; 255 means "unknown/invalid". Some receiver/RSSI_TYPE
-        # combinations never actually update this byte, so it can't be
-        # trusted alone to notice a lost transmitter -- see STATUSTEXT (253).
-        p = _pad(payload, 42)
-        rssi, = struct.unpack_from("<B", p, 41)
-        return msgid, {"rssi": rssi}
+        if msgid == 65:  # RC_CHANNELS -- rssi is the RC link's own quality
+            # reading (ELRS reports it via CRSF telemetry into this field),
+            # scaled 0-254; 255 means "unknown/invalid". Some receiver/RSSI_TYPE
+            # combinations never actually update this byte, so it can't be
+            # trusted alone to notice a lost transmitter -- see STATUSTEXT (253).
+            p = _pad(payload, 42)
+            rssi, = struct.unpack_from("<B", p, 41)
+            return msgid, {"rssi": rssi}
 
-    if msgid == 253:  # STATUSTEXT -- ArduPilot emits "PreArm: Radio
-        # failsafe on" / "...cleared" the instant the RC link state
-        # changes, which is a reliable way to notice a lost transmitter
-        # when RC_CHANNELS.rssi itself won't move.
-        p = _pad(payload, 51)
-        text = bytes(p[1:51]).split(b"\x00", 1)[0].decode()
-        return msgid, {"text": text}
+        if msgid == 33:  # GLOBAL_POSITION_INT -- EKF-fused lat/lon/alt
+            p = _pad(payload, 28)
+            lat, lon, alt, relative_alt = struct.unpack_from("<iiii", p, 4)
+            hdg, = struct.unpack_from("<H", p, 26)
+            return msgid, {
+                "lat_deg": lat / 1e7,
+                "lon_deg": lon / 1e7,
+                "alt_m": alt / 1000.0,
+                "rel_alt_m": relative_alt / 1000.0,
+                "hdg_deg": None if hdg == 65535 else hdg / 100.0,
+            }
 
-    if msgid == 27:  # RAW_IMU -- xmag/ymag/zmag is the external compass
-        # (QMC5883L on the GPS module) in milligauss, raw/uncalibrated.
-        # Decoded here just to confirm real data is flowing; the full
-        # RAW_IMU frame (accel/gyro too) is already logged raw regardless.
-        p = _pad(payload, 26)
-        xmag, ymag, zmag = struct.unpack_from("<hhh", p, 20)
-        return msgid, {"mag_mgauss": (xmag, ymag, zmag)}
+        if msgid == 30:  # ATTITUDE
+            p = _pad(payload, 28)
+            roll, pitch, yaw = struct.unpack_from("<fff", p, 4)
+            return msgid, {
+                "roll_deg": math.degrees(roll),
+                "pitch_deg": math.degrees(pitch),
+                "yaw_deg": math.degrees(yaw) % 360,
+            }
+
+        if msgid == 253:  # STATUSTEXT -- ArduPilot emits "PreArm: Radio
+            # failsafe on" / "...cleared" the instant the RC link state
+            # changes, which is a reliable way to notice a lost transmitter
+            # when RC_CHANNELS.rssi itself won't move.
+            p = _pad(payload, 51)
+            text = bytes(p[1:51]).split(b"\x00", 1)[0].decode()
+            return msgid, {"text": text}
+
+        if msgid == 27:  # RAW_IMU -- xmag/ymag/zmag is the external compass
+            # (QMC5883L on the GPS module) in milligauss, raw/uncalibrated.
+            # Decoded here just to confirm real data is flowing; the full
+            # RAW_IMU frame (accel/gyro too) is already logged raw regardless.
+            p = _pad(payload, 26)
+            xmag, ymag, zmag = struct.unpack_from("<hhh", p, 20)
+            return msgid, {"mag_mgauss": (xmag, ymag, zmag)}
+    except Exception:
+        return msgid, None
 
     return msgid, None
