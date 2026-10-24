@@ -21,11 +21,14 @@ MAVLINK2_STX = 0xFD
 class TelemetryLink:
     """AP + non-blocking UDP socket for relaying MAVLink to/from a GCS."""
 
-    def __init__(self, ssid, password, port):
+    def __init__(self, ssid, password, port, channel=None):
         self.port = port
 
         wlan = network.WLAN(network.AP_IF)
-        wlan.config(essid=ssid, password=password)
+        if channel is not None:
+            wlan.config(essid=ssid, password=password, channel=channel)
+        else:
+            wlan.config(essid=ssid, password=password)
         wlan.active(True)
         while not wlan.active():
             time.sleep_ms(100)

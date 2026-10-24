@@ -235,9 +235,26 @@ Independent, removable telemetry logger tapping the FC's MAVLink stream. Complem
 | VCC | 3V3(OUT) | 36 |
 | GND | GND | 8 |
 
+**Pico ↔ LoRa radio (SPI1, DX-LR30-433M22S on DX-PJ27 breakout)**. Details in [radio-notes.md](radio-notes.md):
+| Radio | Pico | Pico phys pin |
+|---|---|---|
+| SCK | GP10 (SPI1 SCK) | 14 |
+| MOSI | GP11 (SPI1 TX) | 15 |
+| MISO | GP12 (SPI1 RX) | 16 |
+| NSS | GP13 | 17 |
+| BUSY | GP14 | 19 |
+| DIO1 | GP15 | 20 |
+| NRST | GP16 | 21 |
+| TXEN | GP17 | 22 |
+| RXEN | GP18 | 24 |
+| DIO2 | not connected | — |
+| VCC | 3.3 V from a dedicated LDO (not 3V3(OUT)) | — |
+| GND | GND | 18 |
+
 **Power tree:**
 - FC **5 V BEC → Pico VSYS (pin 39)**; FC **GND → Pico GND** (common ground)
 - Pico **3V3(OUT) (pin 36) → SD 3V3 and OLED VCC** (both 3.3 V devices)
+- FC **5 V BEC → AMS1117-3.3 (or AP2112K-3.3) → LoRa radio VCC**. The radio draws about 120 mA in TX bursts, so it is kept off the Pico's 3V3(OUT). Fit 100 µF + 0.1 µF at the radio.
 - All logic 3.3 V end-to-end — no level shifters required. **Never feed the SD adapter 5 V** (this mini type has no regulator).
 
 ## ArduPilot config (FC side, on UART3's serial)
@@ -258,6 +275,11 @@ Independent, removable telemetry logger tapping the FC's MAVLink stream. Complem
   handshake. GCS-originated UDP datagrams on the same port are forwarded
   byte-for-byte back to the FC over UART, so it's a bidirectional bridge
   (telemetry out, commands/params in) — not just one-way re-broadcast.
+- 433 MHz LoRa backup link (`lora_link.py` + `sx126x.py`, see
+  [radio-notes.md](radio-notes.md)): a light message set (heartbeat, attitude,
+  position, GPS, battery, plus params/mission/ACK/STATUSTEXT) goes to a
+  separate ground station within a 10 % duty cycle at 10 mW. GCS frames from
+  the ground station are forwarded to the FC over UART.
 - Debug/flight-event log (`pico_log.py` + `sdlog.TextLogWriter`): every REPL
   debug line (init progress, wifi/AP status) plus flight-summary events
   (mode changes, PreArm failures, ready-to-arm, armed/disarmed, a

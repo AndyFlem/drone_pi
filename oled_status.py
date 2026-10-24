@@ -18,6 +18,7 @@ class StatusDisplay:
             "voltage_v": 0.0, "battery_pct": -1, "uptime_s": 0,
             "log_path": "-", "frames": 0,
             "heading_deg": 0, "rssi_pct": None, "rc_ok": None,
+            "lora_rssi": None,
         }
         self._blink = False
 
@@ -76,5 +77,13 @@ class StatusDisplay:
             sd_text = "Logging." if self._blink else "Logging"
         o.text(sd_text, 0, 52)
         self._blink = not self._blink
+
+        # RSSI (dBm) of the last LoRa packet from the ground; "--" once no
+        # packet has been heard for a few seconds (or no radio fitted).
+        if s["lora_rssi"] is None:
+            lora_text = "L:--"
+        else:
+            lora_text = "L:%d" % s["lora_rssi"]
+        o.text(lora_text, 128 - len(lora_text) * 8, 52)
 
         o.show()

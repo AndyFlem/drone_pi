@@ -2,8 +2,10 @@
 #
 # Reads MAVLink2 off UART0 (wired to FC UART3), writes each frame to a
 # QGroundControl-compatible .tlog on the microSD card, and drives a live
-# status screen on the SSD1306 OLED. Pin/bus assignments: config.py, which
-# mirrors dronespec.md Sec.5.
+# status screen on the SSD1306 OLED. The FC stream is relayed to a GCS over
+# the Pico's WiFi AP (wifi_telem.py) and, as a light message set, over a
+# 433 MHz LoRa backup link (lora_link.py + sx126x.py, see radio-notes.md).
+# Pin/bus assignments: config.py, which mirrors dronespec.md Sec.5.
 #
 # Third-party drivers required alongside this file -- deliberately NOT
 # vendored here; pull the tested upstream versions rather than a hand-copied
@@ -23,7 +25,15 @@ from util import WallClock
 from sdlog import TlogWriter, TextLogWriter
 from oled_status import StatusDisplay
 from wifi_telem import TelemetryLink
+from lora_link import LoraLink
 from pico_log import log, attach as attach_text_log, attach_clock
+import sx126x
+
+# MAV_CMD_SET_MESSAGE_INTERVAL, and the sysid/compid build_heartbeat()/
+# build_set_message_interval() send as.
+_CMD_SET_MESSAGE_INTERVAL = 511
+_OWN_SYSID = 255
+_OWN_COMPID = 190
 
 
 def _translate(msgid, fields):
@@ -54,6 +64,34 @@ def _battery_text(battery):
     return "batt=%.1fV %s" % (battery["voltage_v"], pct)
 
 
+def _is_own_ack(msgid, fields):
+    # The FC's COMMAND_ACKs to our periodic SET_MESSAGE_INTERVAL burst --
+    # one per requested message every STATUS_REQUEST_INTERVAL_MS, which as
+    # LoRa priority traffic would eat a large share of the downlink. (A GCS
+    # on 255/190 sending the same command would lose its ACK over LoRa too;
+    # it will still see it over WiFi.)
+    return (msgid == 77 and fields is not None
+            and fields["command"] == _CMD_SET_MESSAGE_INTERVAL
+            and fields["target_system"] == _OWN_SYSID
+            and fields["target_component"] == _OWN_COMPID)
+
+
+def _start_lora(uart):
+    radio = sx126x.SX126x(config.RADIO_SPI_ID, config.RADIO_SCK_PIN, config.RADIO_MOSI_PIN,
+                          config.RADIO_MISO_PIN, config.RADIO_NSS_PIN, config.RADIO_BUSY_PIN,
+                          config.RADIO_DIO1_PIN, config.RADIO_NRST_PIN, config.RADIO_TXEN_PIN,
+                          config.RADIO_RXEN_PIN, config.RADIO_SPI_BAUD)
+    radio.begin(config.RADIO_FREQ_HZ, config.RADIO_SF, config.RADIO_BW_KHZ, config.RADIO_CR,
+                config.RADIO_PREAMBLE, config.RADIO_TX_POWER_DBM, config.RADIO_SYNC_WORD,
+                config.RADIO_TCXO_VOLTAGE, config.RADIO_USE_DCDC)
+    log("[lora] radio up: %.3f MHz SF%d BW%d %d dBm, %s" % (
+        config.RADIO_FREQ_HZ / 1e6, config.RADIO_SF, config.RADIO_BW_KHZ,
+        config.RADIO_TX_POWER_DBM, "TCXO %.1f V" % radio.tcxo if radio.tcxo else "crystal"))
+    lora = LoraLink(config, radio, uart, led=Pin("LED", Pin.OUT, value=0))
+    log("[lora] " + lora.describe())
+    return lora
+
+
 def _init_stage(label, fn):
     log("[init] %s ..." % label)
     try:
@@ -81,8 +119,19 @@ def main():
 
     link = _init_stage(
         "wifi ap + udp bridge",
-        lambda: TelemetryLink(config.AP_SSID, config.AP_PASSWORD, config.GCS_UDP_PORT),
+        lambda: TelemetryLink(config.AP_SSID, config.AP_PASSWORD, config.GCS_UDP_PORT,
+                               channel=config.AP_CHANNEL),
     )
+
+    log("[init] lora radio ...")
+    try:
+        lora = _start_lora(uart)
+        log("[init] lora radio OK")
+    except Exception as e:
+        # Backup link only -- a missing/faulty radio module mustn't take down
+        # logging or the WiFi link.
+        log("[init] lora radio FAILED: %r -- continuing without LoRa" % e)
+        lora = None
 
     log("[init] sd card + tlog ...")
     try:
@@ -131,9 +180,17 @@ def main():
     last_oled = time.ticks_ms()
     last_stations = time.ticks_ms()
     last_summary = time.ticks_ms()
+    last_lora_stats = time.ticks_ms()
     last_request = 0  # force an immediate request as soon as we know the FC's ids
 
     while True:
+        # The LoRa link is polled at several points per iteration, not just
+        # once: after a transmit it has to be back in RX within a few ms to
+        # catch the ground reply, and an SD sync or OLED push can block for
+        # longer than that.
+        if lora is not None:
+            lora.poll()
+
         for frame in reader.poll():
             if tlog is not None:
                 tlog.write_frame(frame, clock.now())
@@ -142,6 +199,8 @@ def main():
             msgid, fields = decode(frame)
             if msgid not in config.WIFI_EXCLUDE_MSGIDS:
                 link.send(frame)
+            if lora is not None and not _is_own_ack(msgid, fields):
+                lora.offer(frame, msgid)
             if msgid == 0:
                 fc_sysid, fc_compid = frame[5], frame[6]
             if msgid == 2 and fields and fields["time_unix_usec"]:
@@ -176,6 +235,9 @@ def main():
                 elif msgid == 30:
                     last_attitude = fields
 
+        if lora is not None:
+            lora.poll()
+
         for cmd in link.poll_commands():
             uart.write(cmd)
 
@@ -194,9 +256,16 @@ def main():
             last_request = now
 
         if time.ticks_diff(now, last_oled) >= config.OLED_UPDATE_INTERVAL_MS:
-            display.update(frames=frame_count, uptime_s=time.ticks_diff(now, boot_ms) // 1000)
+            display.update(frames=frame_count, uptime_s=time.ticks_diff(now, boot_ms) // 1000,
+                           lora_rssi=lora.rssi if lora is not None else None)
             display.render()
             last_oled = now
+            if lora is not None:
+                lora.poll()
+
+        if lora is not None and time.ticks_diff(now, last_lora_stats) >= config.LORA_STATS_INTERVAL_MS:
+            log("[lora] " + lora.stats())
+            last_lora_stats = now
 
         if time.ticks_diff(now, last_stations) >= config.STATION_CHECK_INTERVAL_MS:
             link.check_stations()

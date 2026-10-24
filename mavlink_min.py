@@ -31,6 +31,12 @@ _MAX_PLAUSIBLE_MSGID = 16383
 # wrong value just gets the frame silently dropped, nothing unsafe.
 _HEARTBEAT_CRC_EXTRA = 50
 _COMMAND_LONG_CRC_EXTRA = 152
+_RADIO_STATUS_CRC_EXTRA = 185
+
+# SiK radios report RADIO_STATUS as sysid '3' / compid 'D'; ArduPilot and the
+# GCSs recognise a telemetry radio by these ids.
+_RADIO_SYSID = 51
+_RADIO_COMPID = 68
 
 # MAV_SYS_STATUS_SENSOR.MAV_SYS_STATUS_PREARM_CHECK -- ArduPilot reports its
 # prearm-check result as a bit in SYS_STATUS's health field (set = armable),
@@ -90,6 +96,29 @@ def build_set_message_interval(seq, target_sysid, target_compid, message_id, int
     ])
     crc = x25crc(header[1:] + payload)
     crc = x25crc(bytes([_COMMAND_LONG_CRC_EXTRA]), crc)
+    return header + payload + struct.pack("<H", crc)
+
+
+def sik_rssi(dbm):
+    """Encode dBm in the SiK RADIO_STATUS scale (dBm = value / 1.9 - 127);
+    None (nothing heard) encodes as 0."""
+    if dbm is None:
+        return 0
+    return max(0, min(254, int((dbm + 127) * 1.9)))
+
+
+def build_radio_status(seq, rxerrors, rssi, remrssi, txbuf, noise, remnoise):
+    """RADIO_STATUS (109) as sent by a SiK-style telemetry radio. rssi/remrssi/
+    noise/remnoise are already SiK-scaled (see sik_rssi); txbuf is free
+    buffer space in percent."""
+    payload = struct.pack("<HHBBBBB", rxerrors, 0, rssi, remrssi, txbuf, noise, remnoise)
+    msgid = 109
+    header = bytes([
+        MAVLINK2_STX, len(payload), 0, 0, seq & 0xFF, _RADIO_SYSID, _RADIO_COMPID,
+        msgid & 0xFF, (msgid >> 8) & 0xFF, (msgid >> 16) & 0xFF,
+    ])
+    crc = x25crc(header[1:] + payload)
+    crc = x25crc(bytes([_RADIO_STATUS_CRC_EXTRA]), crc)
     return header + payload + struct.pack("<H", crc)
 
 
@@ -254,6 +283,18 @@ def decode(frame):
             p = _pad(payload, 51)
             text = bytes(p[1:51]).split(b"\x00", 1)[0].decode()
             return msgid, {"text": text}
+
+        if msgid == 77:  # COMMAND_ACK -- decoded so main can tell the FC's
+            # replies to our own SET_MESSAGE_INTERVAL requests apart from ones
+            # meant for a GCS. target_* are extension fields (0 if absent).
+            p = _pad(payload, 10)
+            command, = struct.unpack_from("<H", p, 0)
+            target_system, target_component = struct.unpack_from("<BB", p, 8)
+            return msgid, {
+                "command": command,
+                "target_system": target_system,
+                "target_component": target_component,
+            }
 
         if msgid == 27:  # RAW_IMU -- xmag/ymag/zmag is the external compass
             # (QMC5883L on the GPS module) in milligauss, raw/uncalibrated.

@@ -1,0 +1,13 @@
+{
+	"folders": [
+		{
+			"path": "."
+		},
+		{
+			"path": "../drone-radio"
+		}
+	],
+	"settings": {
+		"python.languageServer": "Pylance"
+	}
+}
