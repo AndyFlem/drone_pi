@@ -1,17 +1,28 @@
-# oled_status.py -- 128x64 SSD1306 status screen: mode/armable, GPS fix,
-# battery voltage, uptime/RSSI, and SD logging status.
+# lcd_status.py -- 240x240 ST7789 IPS status screen (ZJY-IPS130 V2.0):
+# mode/armable, GPS fix, battery voltage, uptime/RSSI, and SD logging status.
+# Same interface as oled_status.StatusDisplay; config.DISPLAY_TYPE picks one.
 
-from machine import I2C, Pin
+from machine import Pin, SoftSPI
 
-import ssd1306  # mip.install("ssd1306"), see main.py header
+import st7789
+from st7789 import WHITE, RED, GREEN, YELLOW, CYAN, GREY
 
 _MODE_LABEL = {"STABILIZE": "STAB"}  # everything else (ALT_HOLD, LOITER, ...) shown as-is
 
+# Pixel rows of the five text lines -- 16px-tall text spread over 240px.
+_ROW_Y = (12, 60, 108, 156, 204)
+
 
 class StatusDisplay:
-    def __init__(self, i2c_id, sda, scl, addr=0x3C, width=128, height=64):
-        i2c = I2C(i2c_id, sda=Pin(sda), scl=Pin(scl), freq=400_000)
-        self.oled = ssd1306.SSD1306_I2C(width, height, i2c, addr=addr)
+    def __init__(self, sck, mosi, miso, dc, rst, bl=None, rotation=0):
+        # SoftSPI rather than a hardware bus: SPI0 (SD) and SPI1 (radio) are
+        # both taken, and this CS-less panel can't share either of them.
+        # SoftSPI insists on a MISO pin even though the panel never drives it.
+        spi = SoftSPI(baudrate=20_000_000, polarity=1, phase=1,
+                      sck=Pin(sck), mosi=Pin(mosi), miso=Pin(miso))
+        self.lcd = st7789.ST7789(spi, Pin(dc), Pin(rst),
+                                 bl=Pin(bl) if bl is not None else None,
+                                 rotation=rotation)
         self.state = {
             "mode": "?", "armable": None,
             "fix_type": 0, "satellites": 0,
@@ -21,69 +32,72 @@ class StatusDisplay:
             "lora_rssi": None,
         }
         self._blink = False
+        # Last parts drawn per row -- only rows that changed get re-sent,
+        # since every row push holds the CPU for the length of the SoftSPI write.
+        self._drawn = [None] * len(_ROW_Y)
 
     def update(self, **kwargs):
         self.state.update(kwargs)
 
-    def render(self):
-        # Built-in font is 8x8px; at 128px wide that's 16 chars/line max --
-        # keep every line under that or it silently clips off the right edge.
-        #
-        # This panel is a bi-colour SSD1306 (yellow rows 0-15, blue rows
-        # 16-63) -- no line may cross row 16 or it prints half in each
-        # colour. Row 0 is the only line in the yellow band; 16/28/40/52
-        # stay clear of it in blue.
-        s = self.state
-        o = self.oled
-        o.fill(0)
+    def _row(self, i, *parts):
+        if parts != self._drawn[i]:
+            self.lcd.text_row(_ROW_Y[i], parts)
+            self._drawn[i] = parts
 
-        mode_text = _MODE_LABEL.get(s["mode"], s["mode"])[:12]
+    def _right(self, text):
+        # Column that right-aligns text on the row.
+        return self.lcd.cols - len(text)
+
+    def render(self):
+        # 8x8 font doubled to 16x16; at 240px wide that's 15 chars/line max --
+        # keep every line under that or it silently clips off the right edge.
+        s = self.state
+
+        mode_text = _MODE_LABEL.get(s["mode"], s["mode"])[:11]
         if s["armable"] is True:
-            armable_text = "RDY"
+            armable_text, armable_col = "RDY", GREEN
         elif s["armable"] is False:
-            armable_text = "BAD"
+            armable_text, armable_col = "BAD", RED
         else:
-            armable_text = "?"
-        o.text(mode_text, 0, 0)
-        o.text(armable_text, 128 - len(armable_text) * 8, 0)
+            armable_text, armable_col = "?", GREY
+        self._row(0, (0, mode_text, CYAN),
+                  (self._right(armable_text), armable_text, armable_col))
 
         if s["fix_type"] < 2:
-            gps_text = "No-fix"
+            gps_text, gps_col = "No-fix", RED
         else:
-            gps_text = "Fix (%d)" % s["satellites"]
-        o.text(gps_text, 0, 16)
-
+            gps_text, gps_col = "Fix (%d)" % s["satellites"], GREEN
         # No degree glyph in the built-in 8x8 font -- plain zero-padded number.
         heading_text = "%03d" % (s["heading_deg"] % 360)
-        o.text(heading_text, 128 - len(heading_text) * 8, 16)
+        self._row(1, (0, gps_text, gps_col),
+                  (self._right(heading_text), heading_text, WHITE))
 
         pct_text = "%d%%" % s["battery_pct"] if s["battery_pct"] >= 0 else "?%"
-        o.text("Batt:%.1fV %s" % (s["voltage_v"], pct_text), 0, 28)
+        self._row(2, (0, "Batt:%.1fV %s" % (s["voltage_v"], pct_text), YELLOW))
+
         uptime_text = "%02d:%02d" % (s["uptime_s"] // 60, s["uptime_s"] % 60)
         if s["rc_ok"] is False:
             # ArduPilot doesn't reset RC_CHANNELS.rssi on failsafe -- it just
             # stops updating, so a stale reading would otherwise linger here.
-            rssi_text = "RSSI:LOST"
+            rssi_text, rssi_col = "RSSI:LOST", RED
         elif s["rssi_pct"] is not None:
-            rssi_text = "RSSI:%d%%" % s["rssi_pct"]
+            rssi_text, rssi_col = "RSSI:%d%%" % s["rssi_pct"], WHITE
         else:
-            rssi_text = "RSSI:--"
-        o.text(uptime_text, 0, 40)
-        o.text(rssi_text, 128 - len(rssi_text) * 8, 40)
+            rssi_text, rssi_col = "RSSI:--", GREY
+        self._row(3, (0, uptime_text, WHITE),
+                  (self._right(rssi_text), rssi_text, rssi_col))
 
         if s["log_path"] in (None, "no SD"):
-            sd_text = "No SD"
+            sd_text, sd_col = "No SD", RED
         else:
-            sd_text = "Logging." if self._blink else "Logging"
-        o.text(sd_text, 0, 52)
+            sd_text, sd_col = ("Logging." if self._blink else "Logging"), GREEN
         self._blink = not self._blink
 
         # RSSI (dBm) of the last LoRa packet from the ground; "--" once no
         # packet has been heard for a few seconds (or no radio fitted).
         if s["lora_rssi"] is None:
-            lora_text = "L:--"
+            lora_text, lora_col = "L:--", GREY
         else:
-            lora_text = "L:%d" % s["lora_rssi"]
-        o.text(lora_text, 128 - len(lora_text) * 8, 52)
-
-        o.show()
+            lora_text, lora_col = "L:%d" % s["lora_rssi"], WHITE
+        self._row(4, (0, sd_text, sd_col),
+                  (self._right(lora_text), lora_text, lora_col))

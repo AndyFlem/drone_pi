@@ -16,7 +16,7 @@ Replaces the earlier RFM69HCW plan.
 
 ## Wiring — Pico 2 W, SPI1
 SPI1 is kept separate from SPI0 because the microSD driver holds SPI0 during writes.
-Used elsewhere: GP0/1 (UART0 to FC), GP2–5 (SPI0, SD card), GP6/7 (I2C1, OLED).
+Used elsewhere: GP0/1 (UART0 to FC), GP2–5 (SPI0, SD card), GP8, 9, 20, 21, 26, 27 (SoftSPI, ST7789 display).
 
 | Radio | Pico | Phys pin |
 |---|---|---|

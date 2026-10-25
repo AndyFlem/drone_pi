@@ -11,7 +11,7 @@ Component specs looked up from manufacturer/retailer listings (Aug 2026). Perfor
 - **Motors:** T-Motor Velox V2808 **1300 KV**
 - **Navigation:** YEHEI M10Q GNSS + compass (u-blox M10 / QMC5883L) — enables GPS position hold, waypoint/auto missions, RTL
 - **FPV video:** **Analog** — RushFPV Tank Tiny VTX + RunCam Robin 3 V2. DJI O4 not fitted (stack supports it if changed later).
-- **Telemetry logging:** Raspberry Pi Pico 2 W + microSD, capturing MAVLink telemetry via FC UART3; 0.96" OLED for live readout. See §5.
+- **Telemetry logging:** Raspberry Pi Pico 2 W + microSD, capturing MAVLink telemetry via FC UART3; 1.3" ST7789 IPS display for live readout. See §5.
 - **Payload:** AKASO EK7000 4K30FPS action cam, 130 g with mount, included in AUW.
 
 ## UART assignments (H743 FC)
@@ -201,12 +201,12 @@ Battery is the dominant single mass (~52% of AUW). The balance is the frame, scr
 
 # 5. Telemetry Logging Subsystem
 
-Independent, removable telemetry logger tapping the FC's MAVLink stream. Complements (does not replace) the FC's onboard 512 MB `.bin` dataflash logging. The FC streams MAVLink2 out **UART3 (TX3/RX3)**; the Pico logs it to microSD (recommended: QGC-compatible `.tlog` format), drives a 0.96" OLED for live status, and rebroadcasts the stream over its onboard WiFi (AP mode, UDP :14550) to a phone/tablet GCS.
+Independent, removable telemetry logger tapping the FC's MAVLink stream. Complements (does not replace) the FC's onboard 512 MB `.bin` dataflash logging. The FC streams MAVLink2 out **UART3 (TX3/RX3)**; the Pico logs it to microSD (recommended: QGC-compatible `.tlog` format), drives a 1.3" ST7789 IPS display for live status, and rebroadcasts the stream over its onboard WiFi (AP mode, UDP :14550) to a phone/tablet GCS.
 
 ## Parts
 - **Raspberry Pi Pico 2 W** (RP2350, 3.3 V logic, WiFi) — ~7 g
 - **microSD adapter — mini 6-pin SPI type, 3.3 V ONLY** (no onboard regulator or level shifter; silkscreen pins: 3V3 / CS / MOSI / CLK / MISO / GND). Power from Pico 3V3 — **do NOT feed 5 V.** — ~1 g
-- **0.96" OLED, SSD1306, 128×64, I2C** (JMD0.96D-1; pins GND/VCC/SCL/SDA; addr 0x3C default) — ~5 g
+- **1.3" IPS, ST7789, 240×240, SPI** (ZJY-IPS130 V2.0; pins GND/VCC/SCL/SDA/RES/DC/BLK, no CS) — ~5 g
 
 ## Complete wiring
 
@@ -227,13 +227,28 @@ Independent, removable telemetry logger tapping the FC's MAVLink stream. Complem
 | 3V3 | 3V3(OUT) | 36 |
 | GND | GND | 8 |
 
-**Pico ↔ OLED (I2C1):**
-| OLED | Pico | Pico phys pin |
+**Pico ↔ IPS display (SoftSPI, mode 3)** — the 7-pin board has no CS, so it can't share SPI0/SPI1:
+| Display | Pico | Pico phys pin |
 |---|---|---|
-| SDA | GP6 | 9 |
-| SCL | GP7 | 10 |
+| SCL | GP26 | 31 |
+| SDA | GP27 | 32 |
+| RES | GP8 | 11 |
+| DC | GP9 | 12 |
+| BLK | GP20 | 26 |
 | VCC | 3V3(OUT) | 36 |
 | GND | GND | 8 |
+
+GP28 (phys 34) is claimed as SoftSPI's MISO but left unconnected.
+
+**Pico ↔ AKASO EK7000 remote (gutted, coin cell removed)**. Each GPIO goes to the non-ground leg of a remote tactile switch and is driven open-drain: pulled low for 150 ms is a press, floating is released (`camera.py`):
+| Remote | Pico | Pico phys pin |
+|---|---|---|
+| Photo button | GP21 | 27 |
+| Video button | GP22 | 29 |
+| BAT+ | 3V3(OUT) | 36 |
+| BAT− | GND | 28 |
+
+Triggers (`config.py`): RC channel 7 flips toggle recording, RC channel 8 going high takes a photo. Optionally, `CAMERA_RECORD_ON_ARM` toggles recording on arm and on disarm.
 
 **Pico ↔ LoRa radio (SPI1, DX-LR30-433M22S on DX-PJ27 breakout)**. Details in [radio-notes.md](radio-notes.md):
 | Radio | Pico | Pico phys pin |
@@ -253,7 +268,7 @@ Independent, removable telemetry logger tapping the FC's MAVLink stream. Complem
 
 **Power tree:**
 - FC **5 V BEC → Pico VSYS (pin 39)**; FC **GND → Pico GND** (common ground)
-- Pico **3V3(OUT) (pin 36) → SD 3V3 and OLED VCC** (both 3.3 V devices)
+- Pico **3V3(OUT) (pin 36) → SD 3V3 and display VCC** (both 3.3 V devices)
 - FC **5 V BEC → AMS1117-3.3 (or AP2112K-3.3) → LoRa radio VCC**. The radio draws about 120 mA in TX bursts, so it is kept off the Pico's 3V3(OUT). Fit 100 µF + 0.1 µF at the radio.
 - All logic 3.3 V end-to-end — no level shifters required. **Never feed the SD adapter 5 V** (this mini type has no regulator).
 
@@ -266,7 +281,7 @@ Independent, removable telemetry logger tapping the FC's MAVLink stream. Complem
 - Read MAVLink2 frames off UART0 (frames start 0xFD, self-describe length).
 - Write **`.tlog`**: per packet = 8-byte big-endian µs timestamp (`time_us_64()`) + raw bytes → opens directly in MAVExplorer / QGroundControl / pymavlink (no custom decoder).
 - Buffer in RAM, `f_sync` every 1–2 s (power-loss safety; optional supercap).
-- OLED: show live GPS fix/sats, battery V, alt, mode, log status.
+- Display: show live GPS fix/sats, battery V, alt, mode, log status.
 - WiFi AP + UDP MAVLink bridge (`wifi_telem.py`): Pico hosts its own access
   point (SSID/password in `config.py`, default IP 192.168.4.1) and relays
   every FC frame to the AP subnet broadcast address on UDP :14550 as it's
@@ -292,5 +307,5 @@ Independent, removable telemetry logger tapping the FC's MAVLink stream. Complem
 ## To confirm on build
 - UART3 (TX3/RX3) broken out on the GOKU H743 PRO — confirmed as the chosen port (spares: UART1, UART7).
 - Which ArduPilot SERIALx index maps to UART3 on this board target (set PROTOCOL/BAUD/stream rates there).
-- OLED address 0x3C (try 0x3D if blank).
+- Display orientation (`DISPLAY_ROTATION` in `config.py`).
 - SD adapter: confirmed **3.3 V only** — powered from Pico 3V3(OUT), never 5 V. Use a good-quality card; format FAT32/exFAT.

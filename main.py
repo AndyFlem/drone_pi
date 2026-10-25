@@ -2,7 +2,7 @@
 #
 # Reads MAVLink2 off UART0 (wired to FC UART3), writes each frame to a
 # QGroundControl-compatible .tlog on the microSD card, and drives a live
-# status screen on the SSD1306 OLED. The FC stream is relayed to a GCS over
+# status screen (SSD1306 OLED or ST7789 IPS, per config.DISPLAY_TYPE). The FC stream is relayed to a GCS over
 # the Pico's WiFi AP (wifi_telem.py) and, as a light message set, over a
 # 433 MHz LoRa backup link (lora_link.py + sx126x.py, see radio-notes.md).
 # Pin/bus assignments: config.py, which mirrors dronespec.md Sec.5.
@@ -11,7 +11,7 @@
 # vendored here; pull the tested upstream versions rather than a hand-copied
 # one, since SD/SPI block-device timing is easy to get subtly wrong:
 #   import mip; mip.install("sdcard")
-#   import mip; mip.install("ssd1306")
+#   import mip; mip.install("ssd1306")   # only for DISPLAY_TYPE = "ssd1306"
 # (run those once from a REPL with the board on Wi-Fi, or copy sdcard.py /
 # ssd1306.py from the official micropython/micropython drivers/ tree onto
 # the board next to this file.)
@@ -23,9 +23,9 @@ import config
 from mavlink_min import FrameReader, build_heartbeat, build_set_message_interval, decode
 from util import WallClock
 from sdlog import TlogWriter, TextLogWriter
-from oled_status import StatusDisplay
 from wifi_telem import TelemetryLink
 from lora_link import LoraLink
+from camera import CameraRemote, RcSwitch, PHOTO, VIDEO
 from pico_log import log, attach as attach_text_log, attach_clock
 import sx126x
 
@@ -92,6 +92,19 @@ def _start_lora(uart):
     return lora
 
 
+def _start_display():
+    # Imported here so only the selected screen's driver has to be on the board.
+    if config.DISPLAY_TYPE == "st7789":
+        from lcd_status import StatusDisplay
+        return StatusDisplay(config.DISPLAY_SCK_PIN, config.DISPLAY_MOSI_PIN,
+                             config.DISPLAY_MISO_PIN, config.DISPLAY_DC_PIN,
+                             config.DISPLAY_RST_PIN, bl=config.DISPLAY_BL_PIN,
+                             rotation=config.DISPLAY_ROTATION)
+    from oled_status import StatusDisplay
+    return StatusDisplay(config.I2C_ID, config.I2C_SDA_PIN, config.I2C_SCL_PIN,
+                         addr=config.OLED_ADDR)
+
+
 def _init_stage(label, fn):
     log("[init] %s ..." % label)
     try:
@@ -151,17 +164,24 @@ def main():
             log("[init] text log FAILED: %r -- REPL-only debug output" % e)
     except Exception as e:
         # SD card/adapter not wired in yet (or faulty) -- keep flying blind on
-        # logging rather than bricking the OLED status readout over it.
+        # logging rather than bricking the status display over it.
         log("[init] sd card + tlog FAILED: %r -- continuing without SD logging" % e)
         tlog = None
         log_path = "no SD"
 
     display = _init_stage(
-        "oled",
-        lambda: StatusDisplay(config.I2C_ID, config.I2C_SDA_PIN, config.I2C_SCL_PIN,
-                               addr=config.OLED_ADDR),
+        "display (%s)" % config.DISPLAY_TYPE,
+        _start_display,
     )
     display.update(log_path=log_path)
+
+    camera = _init_stage(
+        "camera remote",
+        lambda: CameraRemote(config.CAMERA_PHOTO_PIN, config.CAMERA_VIDEO_PIN,
+                             press_ms=config.CAMERA_PRESS_MS, gap_ms=config.CAMERA_GAP_MS),
+    )
+    video_switch = RcSwitch(config.CAMERA_VIDEO_RC_CHAN) if config.CAMERA_VIDEO_RC_CHAN else None
+    photo_switch = RcSwitch(config.CAMERA_PHOTO_RC_CHAN) if config.CAMERA_PHOTO_RC_CHAN else None
 
     log("=== entering main loop ===")
 
@@ -177,7 +197,7 @@ def main():
     last_attitude = None
     last_battery = None
     last_heartbeat = time.ticks_ms()
-    last_oled = time.ticks_ms()
+    last_display = time.ticks_ms()
     last_stations = time.ticks_ms()
     last_summary = time.ticks_ms()
     last_lora_stats = time.ticks_ms()
@@ -186,7 +206,7 @@ def main():
     while True:
         # The LoRa link is polled at several points per iteration, not just
         # once: after a transmit it has to be back in RX within a few ms to
-        # catch the ground reply, and an SD sync or OLED push can block for
+        # catch the ground reply, and an SD sync or display push can block for
         # longer than that.
         if lora is not None:
             lora.poll()
@@ -221,6 +241,11 @@ def main():
                         batt = _battery_text(last_battery)
                         log("[flight] %s%s" % ("ARMED" if armed else "DISARMED",
                                                 " (%s)" % batt if batt else ""))
+                        # last_armed is None on the first HEARTBEAT -- booting
+                        # into an already-armed FC isn't an arm event.
+                        if config.CAMERA_RECORD_ON_ARM and last_armed is not None:
+                            log("[camera] video toggle (%s)" % ("armed" if armed else "disarmed"))
+                            camera.press(VIDEO)
                         last_armed = armed
                 elif msgid == 1:
                     last_battery = fields
@@ -230,6 +255,14 @@ def main():
                         last_armable = armable
                 elif msgid == 253 and "prearm" in fields["text"].lower():
                     log("[flight] %s" % fields["text"])
+                elif msgid == 65:
+                    channels = fields["channels"]
+                    if video_switch is not None and video_switch.update(channels) is not None:
+                        log("[camera] video toggle (ch%d)" % config.CAMERA_VIDEO_RC_CHAN)
+                        camera.press(VIDEO)
+                    if photo_switch is not None and photo_switch.update(channels):
+                        log("[camera] photo (ch%d)" % config.CAMERA_PHOTO_RC_CHAN)
+                        camera.press(PHOTO)
                 elif msgid == 33:
                     last_position = fields
                 elif msgid == 30:
@@ -237,6 +270,7 @@ def main():
 
         if lora is not None:
             lora.poll()
+        camera.poll()
 
         for cmd in link.poll_commands():
             uart.write(cmd)
@@ -255,11 +289,11 @@ def main():
                 request_seq = (request_seq + 1) & 0xFF
             last_request = now
 
-        if time.ticks_diff(now, last_oled) >= config.OLED_UPDATE_INTERVAL_MS:
+        if time.ticks_diff(now, last_display) >= config.DISPLAY_UPDATE_INTERVAL_MS:
             display.update(frames=frame_count, uptime_s=time.ticks_diff(now, boot_ms) // 1000,
                            lora_rssi=lora.rssi if lora is not None else None)
             display.render()
-            last_oled = now
+            last_display = now
             if lora is not None:
                 lora.poll()
 

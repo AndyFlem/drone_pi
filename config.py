@@ -28,27 +28,60 @@ RADIO_NRST_PIN = 16
 RADIO_TXEN_PIN = 17
 RADIO_RXEN_PIN = 18
 
-# I2C1 (Pico <-> SSD1306 OLED)
+# Which status screen is fitted: "ssd1306" (0.96" OLED, oled_status.py) or
+# "st7789" (1.3" IPS, lcd_status.py).
+DISPLAY_TYPE = "st7789" #"ssd1306"
+
+# I2C1 (Pico <-> SSD1306 OLED). Hardware I2C1 only allows SDA on GP26 and
+# SCL on GP27 for this pin pair -- not the other way round.
 I2C_ID = 1
-I2C_SDA_PIN = 6
-I2C_SCL_PIN = 7
+I2C_SDA_PIN = 26
+I2C_SCL_PIN = 27
 OLED_ADDR = 0x3C  # try 0x3D if the screen stays blank
 
+# SoftSPI (Pico <-> ST7789 240x240 IPS, ZJY-IPS130 V2.0). The 7-pin board
+# has no CS, so it gets its own pins rather than sharing SPI0/SPI1.
+DISPLAY_SCK_PIN = 27  # board "SCL"
+DISPLAY_MOSI_PIN = 26  # board "SDA"
+DISPLAY_MISO_PIN = 28  # unconnected -- SoftSPI requires one (GP21 is the camera remote now)
+DISPLAY_RST_PIN = 8  # board "RES"
+DISPLAY_DC_PIN = 9
+DISPLAY_BL_PIN = 20  # board "BLK"; None if BLK is tied to 3V3
+DISPLAY_ROTATION = 0  # 0-3, quarter turns
+
+# AKASO EK7000 remote (camera.py): GPIOs wired to the non-ground leg of the
+# remote's photo/video switches; the remote runs off Pico 3V3(OUT) + GND in
+# place of its CR2032.
+CAMERA_PHOTO_PIN = 21
+CAMERA_VIDEO_PIN = 22
+CAMERA_PRESS_MS = 150  # how long a "press" holds the pin low
+CAMERA_GAP_MS = 250  # released time between queued presses
+# RC channels (1-based, from RC_CHANNELS) that drive the camera, or None to
+# disable. Video: every flip of the switch, either way, presses record
+# (the EK7000 toggles start/stop). Photo: each move to high takes a shot, so
+# a momentary button or a 2-pos switch both work.
+CAMERA_VIDEO_RC_CHAN = 7
+CAMERA_PHOTO_RC_CHAN = 8
+# Also press record on arm and again on disarm. The Pico can't see whether
+# the camera is actually recording, so if this is on, leave the video switch
+# alone while armed or the two will get out of step.
+CAMERA_RECORD_ON_ARM = False
+
 SD_SYNC_INTERVAL_MS = 1500
-OLED_UPDATE_INTERVAL_MS = 400
+DISPLAY_UPDATE_INTERVAL_MS = 400
 HEARTBEAT_INTERVAL_MS = 1000
 STATION_CHECK_INTERVAL_MS = 2000  # how often to poll for AP client connect/disconnect
 FLIGHT_SUMMARY_INTERVAL_MS = 5000  # how often to log a position/attitude summary line
 
 # Messages requested explicitly via MAV_CMD_SET_MESSAGE_INTERVAL, since this
 # port has no SRx_* stream-rate group of its own (see mavlink_min.
-# build_set_message_interval). msgid=0/1/24/65/74 are decoded for the OLED
+# build_set_message_interval). msgid=0/1/24/65/74 are decoded for the display
 # (main._translate) and msgid=2 for wall-clock sync (main.main, util.
 # WallClock) -- everything else here is requested purely so the raw bytes
 # land in the .tlog for post-flight analysis; rate chosen per message's role
 # (attitude/RC faster, slow-changing power/pressure data slower).
 #
-# STATUSTEXT (253) is also decoded for the OLED (RC failsafe detection) but
+# STATUSTEXT (253) is also decoded for the display (RC failsafe detection) but
 # is deliberately not listed here -- it's event-driven and ArduPilot sends
 # it unprompted whenever there's something to report, not on a stream rate.
 REQUESTED_MSG_INTERVALS_US = {
@@ -112,16 +145,16 @@ RADIO_CR = 1  # 1..4 = 4/5..4/8
 RADIO_PREAMBLE = 12
 RADIO_SYNC_WORD = 0x1424  # private LoRa network
 # UK licence-exempt 433 MHz: 10 mW ERP. Raise only under an amateur licence.
-RADIO_TX_POWER_DBM = 10
+RADIO_TX_POWER_DBM = 22
 # ERC 70-03 Annex 1 band c1 (433.05-434.79 MHz, 10 mW) limits duty cycle to
 # 10 %. Set to 1.0 if operating under an amateur licence.
-RADIO_DUTY_CYCLE = 0.10
+RADIO_DUTY_CYCLE = 1
 
 # Link protocol -- must match the ground station (both ends derive the
 # per-packet size limits from these).
 LORA_NET_ID = 0x5A  # packets with a different id are ignored
 DRONE_TX_INTERVAL_MS = 1000  # drone owns the timing
-GROUND_REPLY_DELAY_MS = 5  # ground waits this long after a drone packet before replying
+GROUND_REPLY_DELAY_MS = 100  # ground waits this long after a drone packet before replying; covers main-loop stalls before RX is re-armed
 GUARD_MS = 30  # margin left at the end of each slot
 
 # Light message set sent over LoRa (FC -> ground); everything else is

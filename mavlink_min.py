@@ -252,8 +252,9 @@ def decode(frame):
             # combinations never actually update this byte, so it can't be
             # trusted alone to notice a lost transmitter -- see STATUSTEXT (253).
             p = _pad(payload, 42)
+            channels = struct.unpack_from("<18H", p, 4)  # chan1..chan18 raw, µs
             rssi, = struct.unpack_from("<B", p, 41)
-            return msgid, {"rssi": rssi}
+            return msgid, {"channels": channels, "rssi": rssi}
 
         if msgid == 33:  # GLOBAL_POSITION_INT -- EKF-fused lat/lon/alt
             p = _pad(payload, 28)
