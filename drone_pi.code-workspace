@@ -5,6 +5,10 @@
 		},
 		{
 			"path": "../drone-radio"
+		},
+		{
+			"name": "Board Filesystem",
+			"uri": "pico:"
 		}
 	],
 	"settings": {

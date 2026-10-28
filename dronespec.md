@@ -143,7 +143,7 @@ YEHEI-branded M10Q-5883-class module (u-blox M10 reference design). Provides GPS
 | Props ×4 | ~48 g |
 | GNSS/compass (YEHEI M10Q) | ~8 g |
 | RX + VTX + FPV cam | ~8 g |
-| Telemetry logger (Pico 2 W + SD + OLED + wiring) | ~18 g |
+| Telemetry logger (Pico 2 W + SD + display + wiring) | ~18 g |
 | AKASO EK7000 4K (payload, w/ mount) | 130 g |
 | **Subtotal of above** | **~1383 g** |
 | Frame + hardware + wiring + antennas (balance) | **~367 g** |
@@ -201,12 +201,19 @@ Battery is the dominant single mass (~52% of AUW). The balance is the frame, scr
 
 # 5. Telemetry Logging Subsystem
 
-Independent, removable telemetry logger tapping the FC's MAVLink stream. Complements (does not replace) the FC's onboard 512 MB `.bin` dataflash logging. The FC streams MAVLink2 out **UART3 (TX3/RX3)**; the Pico logs it to microSD (recommended: QGC-compatible `.tlog` format), drives a 1.3" ST7789 IPS display for live status, and rebroadcasts the stream over its onboard WiFi (AP mode, UDP :14550) to a phone/tablet GCS.
+Independent, removable telemetry logger tapping the FC's MAVLink stream. Complements (does not replace) the FC's onboard 512 MB `.bin` dataflash logging. The FC streams MAVLink2 out **UART3 (TX3/RX3)** at 921600 baud. The Pico:
+- logs every frame to microSD as a QGC-compatible `.tlog`, plus a plaintext `.txt` event log;
+- drives a 1.3" ST7789 IPS display for live status;
+- bridges the stream over its onboard WiFi (AP mode, UDP :14550) to a phone/tablet GCS;
+- sends a light message set over a 433 MHz LoRa backup link to a separate ground station;
+- triggers the AKASO EK7000's photo/record buttons from RC switches.
 
 ## Parts
 - **Raspberry Pi Pico 2 W** (RP2350, 3.3 V logic, WiFi) — ~7 g
 - **microSD adapter — mini 6-pin SPI type, 3.3 V ONLY** (no onboard regulator or level shifter; silkscreen pins: 3V3 / CS / MOSI / CLK / MISO / GND). Power from Pico 3V3 — **do NOT feed 5 V.** — ~1 g
-- **1.3" IPS, ST7789, 240×240, SPI** (ZJY-IPS130 V2.0; pins GND/VCC/SCL/SDA/RES/DC/BLK, no CS) — ~5 g
+- **1.3" IPS, ST7789, 240×240, SPI** (ZJY-IPS130 V2.0; pins GND/VCC/SCL/SDA/RES/DC/BLK, no CS) — ~5 g. Selected by `DISPLAY_TYPE = "st7789"`. A 0.96" SSD1306 I2C OLED is still supported as an alternative (`DISPLAY_TYPE = "ssd1306"`, I2C1 with SDA on GP26 and SCL on GP27, address 0x3C).
+- **AKASO EK7000 2.4 GHz remote**, gutted, with its CR2032 removed
+- **DX-LR30-433M22S LoRa module** on a DX-PJ27 breakout, plus a 3.3 V LDO (see [radio-notes.md](radio-notes.md))
 
 ## Complete wiring
 
@@ -238,9 +245,9 @@ Independent, removable telemetry logger tapping the FC's MAVLink stream. Complem
 | VCC | 3V3(OUT) | 36 |
 | GND | GND | 8 |
 
-GP28 (phys 34) is claimed as SoftSPI's MISO but left unconnected.
+GP28 (phys 34) is claimed as SoftSPI's MISO but left unconnected. The SoftSPI runs at a nominal 20 MHz, and only rows whose text has changed are redrawn.
 
-**Pico ↔ AKASO EK7000 remote (gutted, coin cell removed)**. Each GPIO goes to the non-ground leg of a remote tactile switch and is driven open-drain: pulled low for 150 ms is a press, floating is released (`camera.py`):
+**Pico ↔ AKASO EK7000 remote (gutted, coin cell removed)**. Each GPIO goes to the non-ground leg of a remote tactile switch and is driven open-drain: pulled low for 300 ms (`CAMERA_PRESS_MS`) is a press, floating is released. Presses are queued one at a time with a 250 ms gap (`CAMERA_GAP_MS`), so the remote never sees both buttons at once (`camera.py`):
 | Remote | Pico | Pico phys pin |
 |---|---|---|
 | Photo button | GP21 | 27 |
@@ -248,7 +255,11 @@ GP28 (phys 34) is claimed as SoftSPI's MISO but left unconnected.
 | BAT+ | 3V3(OUT) | 36 |
 | BAT− | GND | 28 |
 
-Triggers (`config.py`): RC channel 7 flips toggle recording, RC channel 8 going high takes a photo. Optionally, `CAMERA_RECORD_ON_ARM` toggles recording on arm and on disarm.
+Triggers (`config.py`), read from RC_CHANNELS with high ≥ 1700 µs and low ≤ 1300 µs:
+- **RC channel 7** (`CAMERA_VIDEO_RC_CHAN`): every flip, in either direction, presses record. The EK7000 toggles start/stop on each press.
+- **RC channel 9** (`CAMERA_PHOTO_RC_CHAN`): each move to high takes a photo.
+- The switch position at boot only sets the baseline and does not count as a flip.
+- `CAMERA_RECORD_ON_ARM` (currently **off**) also presses record on arm and on disarm. The Pico can't see whether the camera is recording, so with this on, leave the video switch alone while armed.
 
 **Pico ↔ LoRa radio (SPI1, DX-LR30-433M22S on DX-PJ27 breakout)**. Details in [radio-notes.md](radio-notes.md):
 | Radio | Pico | Pico phys pin |
@@ -274,38 +285,49 @@ Triggers (`config.py`): RC channel 7 flips toggle recording, RC channel 8 going 
 
 ## ArduPilot config (FC side, on UART3's serial)
 - `SERIALx_PROTOCOL = 2` (MAVLink2) — SERIALx = whichever SERIAL number ArduPilot maps to UART3 on this target
-- `SERIALx_BAUD = 921` (921600; 115 also fine)
-- Set the port's `SRx_*` stream rates (ATTITUDE, POSITION, EXTRA1/2/3, RAW_SENS, RC_CHAN, EXT_STAT) to desired Hz. Pico sending a heartbeat helps ArduPilot start streaming.
+- `SERIALx_BAUD = 921` (921600, matching `UART_BAUD` in `config.py`)
+- Stream rates don't need to be set on the FC. The Pico sends a HEARTBEAT every second (sysid 255, compid 190) and, once it has seen the FC's HEARTBEAT, requests each message in `REQUESTED_MSG_INTERVALS_US` with `MAV_CMD_SET_MESSAGE_INTERVAL`. The requests are re-sent every 5 s (`STATUS_REQUEST_INTERVAL_MS`) in case one is dropped.
 
-## Pico firmware approach
-- Read MAVLink2 frames off UART0 (frames start 0xFD, self-describe length).
-- Write **`.tlog`**: per packet = 8-byte big-endian µs timestamp (`time_us_64()`) + raw bytes → opens directly in MAVExplorer / QGroundControl / pymavlink (no custom decoder).
-- Buffer in RAM, `f_sync` every 1–2 s (power-loss safety; optional supercap).
-- Display: show live GPS fix/sats, battery V, alt, mode, log status.
-- WiFi AP + UDP MAVLink bridge (`wifi_telem.py`): Pico hosts its own access
-  point (SSID/password in `config.py`, default IP 192.168.4.1) and relays
-  every FC frame to the AP subnet broadcast address on UDP :14550 as it's
-  read, so QGroundControl's UDP auto-connect (which listens passively and
-  adopts whichever sender it first hears from) picks it up with no
-  handshake. GCS-originated UDP datagrams on the same port are forwarded
-  byte-for-byte back to the FC over UART, so it's a bidirectional bridge
-  (telemetry out, commands/params in) — not just one-way re-broadcast.
-- 433 MHz LoRa backup link (`lora_link.py` + `sx126x.py`, see
-  [radio-notes.md](radio-notes.md)): a light message set (heartbeat, attitude,
-  position, GPS, battery, plus params/mission/ACK/STATUSTEXT) goes to a
-  separate ground station within a 10 % duty cycle at 10 mW. GCS frames from
-  the ground station are forwarded to the FC over UART.
-- Debug/flight-event log (`pico_log.py` + `sdlog.TextLogWriter`): every REPL
-  debug line (init progress, wifi/AP status) plus flight-summary events
-  (mode changes, PreArm failures, ready-to-arm, armed/disarmed, a
-  position+attitude line every 5 s) also get appended to a plaintext
-  `logNNNN.txt` alongside the matching `logNNNN.tlog` on the SD card, when
-  the card is available.
-- MicroPython is sufficient at telemetry rates; C/Pico-SDK + FatFs only if pushing very high rates.
-- SD init note: the mini adapter has no card-detect; SPI clock init low (~400 kHz) then raise to ~12–25 MHz after mount. Keep SPI wires short — bare adapters aren't great at high clock over long leads.
+## Requested message rates
+| Message | Rate | Used for |
+|---|---|---|
+| ATTITUDE, RC_CHANNELS | 10 Hz | log, camera triggers, display RSSI |
+| GLOBAL_POSITION_INT, VFR_HUD | 5 Hz | log, display heading, flight summary |
+| SERVO_OUTPUT_RAW, RAW_IMU, ESC_STATUS, ESC_TELEMETRY_1_TO_4 | 5 Hz | `.tlog` only |
+| SYS_STATUS, GPS_RAW_INT | 2 Hz | display (battery, armable, GPS fix) |
+| SCALED_PRESSURE, VIBRATION | 2 Hz | `.tlog` only |
+| SYSTEM_TIME | 1 Hz | GPS-derived wall clock for log timestamps |
+| POWER_STATUS, ESC_INFO | 1 Hz | `.tlog` only |
+| MISSION_CURRENT, BATTERY_STATUS, EXTENDED_SYS_STATE | 1 Hz | LoRa link |
+| HOME_POSITION | 0.2 Hz | LoRa link |
+
+STATUSTEXT is not requested, since ArduPilot sends it whenever it has something to report. The Pico uses it to detect RC failsafe and PreArm messages.
+
+## Pico firmware (MicroPython)
+Boot order in `main.py`: UART → WiFi AP → LoRa radio → SD card and logs → display → camera remote. A LoRa, SD or text-log failure is logged and skipped so the rest keeps running. A UART, WiFi, display or camera failure stops start-up. Third-party drivers needed on the board: `sdcard` (via `mip`), and `ssd1306` only if that display is selected.
+
+- **MAVLink reader** (`mavlink_min.py`): reads MAVLink2 frames off UART0 (1 KB RX buffer) and decodes the few messages the display and logs need.
+- **`.tlog`** (`sdlog.TlogWriter`): each record is an 8-byte big-endian µs timestamp followed by the raw frame bytes, so the file opens directly in MAVExplorer, QGroundControl or pymavlink. Timestamps come from `util.WallClock`, which syncs to the FC's SYSTEM_TIME once GPS time is available. Files are named `logNNNN.tlog`, using the next free number, and are flushed with `os.sync()` every 1.5 s (`SD_SYNC_INTERVAL_MS`). The SD SPI bus runs at 1 MHz.
+- **Event log** (`pico_log.py` + `sdlog.TextLogWriter`): every REPL debug line is also appended to `logNNNN.txt` next to the matching `.tlog`. This covers init progress, WiFi station connects and disconnects, LoRa link stats every 5 s, camera triggers, and flight events:
+  - mode changes, PreArm failures, ready / not ready to arm;
+  - armed / disarmed, with battery voltage;
+  - a battery + position + attitude summary line every 5 s.
+- **Display** (`lcd_status.py`, or `oled_status.py` for the SSD1306), refreshed every 400 ms:
+  | Row | Left | Right |
+  |---|---|---|
+  | 1 | Flight mode | Armable: `RDY` / `BAD` / `?` |
+  | 2 | GPS: `No-fix` or `Fix (sats)` | Heading |
+  | 3 | Battery voltage and % | — |
+  | 4 | Pico uptime (mm:ss) | RC RSSI %, or `RSSI:LOST` on RC failsafe |
+  | 5 | SD status: `Logging` (blinking) or `No SD` | LoRa RSSI of last ground packet (`L:-85` or `L:--`) |
+- **WiFi AP + UDP MAVLink bridge** (`wifi_telem.py`): the Pico hosts its own access point (`AP_SSID` / `AP_PASSWORD` in `config.py`, fixed on channel 6, default IP 192.168.4.1). FC frames are broadcast to the AP subnet on UDP :14550 as they're read, so QGroundControl's UDP auto-connect picks the stream up with no handshake. The `.tlog`-only messages in `WIFI_EXCLUDE_MSGIDS` (RAW_IMU, SERVO_OUTPUT_RAW, VIBRATION, SCALED_PRESSURE, POWER_STATUS, ESC_*) are not relayed, because they were slowing Mission Planner's parameter download to about 60 s. MAVLink datagrams from the GCS are written byte for byte to the FC, so the bridge works both ways (telemetry out, commands and params in).
+- **433 MHz LoRa backup link** (`lora_link.py` + `sx126x.py`, see [radio-notes.md](radio-notes.md)): a light message set goes to a separate ground station, and GCS frames from the ground station are written to the FC. The Pico's onboard LED blinks on each ground packet received.
+- **Camera remote** (`camera.py`): see the wiring section above.
 
 ## To confirm on build
 - UART3 (TX3/RX3) broken out on the GOKU H743 PRO — confirmed as the chosen port (spares: UART1, UART7).
-- Which ArduPilot SERIALx index maps to UART3 on this board target (set PROTOCOL/BAUD/stream rates there).
+- Which ArduPilot SERIALx index maps to UART3 on this board target (set PROTOCOL/BAUD there).
 - Display orientation (`DISPLAY_ROTATION` in `config.py`).
 - SD adapter: confirmed **3.3 V only** — powered from Pico 3V3(OUT), never 5 V. Use a good-quality card; format FAT32/exFAT.
+- Change `AP_SSID` / `AP_PASSWORD` from the placeholders before flying.
+- LoRa TX power and duty cycle: `config.py` currently has 22 dBm at 100 % duty, which is above the UK licence-exempt limit (see [radio-notes.md](radio-notes.md)).

@@ -54,14 +54,14 @@ DISPLAY_ROTATION = 0  # 0-3, quarter turns
 # place of its CR2032.
 CAMERA_PHOTO_PIN = 21
 CAMERA_VIDEO_PIN = 22
-CAMERA_PRESS_MS = 150  # how long a "press" holds the pin low
+CAMERA_PRESS_MS = 300  # how long a "press" holds the pin low
 CAMERA_GAP_MS = 250  # released time between queued presses
 # RC channels (1-based, from RC_CHANNELS) that drive the camera, or None to
 # disable. Video: every flip of the switch, either way, presses record
 # (the EK7000 toggles start/stop). Photo: each move to high takes a shot, so
 # a momentary button or a 2-pos switch both work.
 CAMERA_VIDEO_RC_CHAN = 7
-CAMERA_PHOTO_RC_CHAN = 8
+CAMERA_PHOTO_RC_CHAN = 9
 # Also press record on arm and again on disarm. The Pico can't see whether
 # the camera is actually recording, so if this is on, leave the video switch
 # alone while armed or the two will get out of step.
