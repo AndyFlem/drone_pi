@@ -2,7 +2,10 @@
 # mode/armable, GPS fix, battery voltage, uptime/RSSI, and SD logging status.
 # Same interface as oled_status.StatusDisplay; config.DISPLAY_TYPE picks one.
 
-from machine import Pin, SoftSPI
+import time
+
+import rp2
+from machine import Pin
 
 import st7789
 from st7789 import WHITE, RED, GREEN, YELLOW, CYAN, GREY
@@ -13,13 +16,47 @@ _MODE_LABEL = {"STABILIZE": "STAB"}  # everything else (ALT_HOLD, LOITER, ...) s
 _ROW_Y = (12, 60, 108, 156, 204)
 
 
+# Write-only SPI mode 3, MSB first: data changes on the falling edge, the
+# panel samples on the rising one, 2 PIO cycles per bit plus 2 per byte. SCK
+# must idle high between bytes -- with no CS pin the panel only stays in
+# step if the clock rests high, so the SM waits on `pull` with SCK high
+# rather than stalling mid-bit.
+@rp2.asm_pio(out_init=rp2.PIO.OUT_LOW, sideset_init=rp2.PIO.OUT_HIGH,
+             out_shiftdir=rp2.PIO.SHIFT_LEFT, fifo_join=rp2.PIO.JOIN_TX)
+def _spi_tx():
+    pull().side(1)
+    set(x, 7).side(1)
+    label("bit")
+    out(pins, 1).side(0)
+    jmp(x_dec, "bit").side(1)
+
+
+class PioSpiTx:
+    # Stand-in for machine.SPI with just the write() st7789 uses. Replaces
+    # SoftSPI, whose bit-banged ~0.5 Mbit/s held the main loop for ~125 ms
+    # per text row and overflowed the UART RX buffer (log0103 [loop] stats).
+    def __init__(self, sm_id, sck, mosi, baudrate):
+        self._sm = rp2.StateMachine(sm_id, _spi_tx, freq=2 * baudrate,
+                                    sideset_base=Pin(sck), out_base=Pin(mosi))
+        self._sm.active(1)
+        # Time for the last byte to leave the OSR once the FIFO reads empty.
+        # 9 bit-times per byte (8 bits + pull/set).
+        self._drain_us = 9_000_000 // baudrate + 1
+
+    def write(self, buf):
+        self._sm.put(buf, 24)  # one byte per FIFO word, moved to the top bits
+        # Block until it's all on the wire: st7789 flips DC straight after.
+        while self._sm.tx_fifo():
+            pass
+        time.sleep_us(self._drain_us)
+
+
 class StatusDisplay:
-    def __init__(self, sck, mosi, miso, dc, rst, bl=None, rotation=0):
-        # SoftSPI rather than a hardware bus: SPI0 (SD) and SPI1 (radio) are
-        # both taken, and this CS-less panel can't share either of them.
-        # SoftSPI insists on a MISO pin even though the panel never drives it.
-        spi = SoftSPI(baudrate=20_000_000, polarity=1, phase=1,
-                      sck=Pin(sck), mosi=Pin(mosi), miso=Pin(miso))
+    def __init__(self, sck, mosi, dc, rst, bl=None, rotation=0,
+                 pio_sm=0, baudrate=20_000_000):
+        # PIO rather than a hardware bus: SPI0 (SD) and SPI1 (radio) are both
+        # taken, and this CS-less panel can't share either of them.
+        spi = PioSpiTx(pio_sm, sck, mosi, baudrate)
         self.lcd = st7789.ST7789(spi, Pin(dc), Pin(rst),
                                  bl=Pin(bl) if bl is not None else None,
                                  rotation=rotation)
@@ -33,7 +70,7 @@ class StatusDisplay:
         }
         self._blink = False
         # Last parts drawn per row -- only rows that changed get re-sent,
-        # since every row push holds the CPU for the length of the SoftSPI write.
+        # since every row push holds the CPU until its ~7.7 KB is on the wire.
         self._drawn = [None] * len(_ROW_Y)
 
     def update(self, **kwargs):

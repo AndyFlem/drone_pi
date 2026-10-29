@@ -21,6 +21,37 @@ class MonotonicUs:
         return self._total
 
 
+class LoopProfiler:
+    """Worst-case duration per named main-loop section, for finding what
+    stalls the loop long enough to overflow the UART RX buffer.
+
+    t = prof.start(); ...work...; prof.stop("name", t) -- keeps the max
+    microseconds seen per name since the last report(), which returns a
+    one-line summary (ms) and resets.
+    """
+
+    def __init__(self):
+        self._max = {}
+
+    def start(self):
+        return time.ticks_us()
+
+    def stop(self, name, t0):
+        d = time.ticks_diff(time.ticks_us(), t0)
+        if d > self._max.get(name, 0):
+            self._max[name] = d
+
+    def note(self, name, us):
+        # For durations measured elsewhere (e.g. os.sync inside sdlog).
+        if us > self._max.get(name, 0):
+            self._max[name] = us
+
+    def report(self):
+        s = " ".join("%s=%.1f" % (k, v / 1000) for k, v in sorted(self._max.items()))
+        self._max = {}
+        return s
+
+
 class WallClock:
     """Microsecond clock for .tlog frame timestamps.
 

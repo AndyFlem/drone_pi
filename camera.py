@@ -51,30 +51,47 @@ class CameraRemote:
 class RcSwitch:
     # Two-position view of one RC channel, with hysteresis so a switch
     # sitting near mid-stick doesn't chatter. update() returns the new
-    # position (True = high) on a change, else None. The first valid reading
-    # only sets the baseline -- booting with a switch already up mustn't
-    # count as a flip.
-    def __init__(self, channel, high_us=1700, low_us=1300):
+    # position (True = high) on a change, else None. A position only counts
+    # once `confirm` RC_CHANNELS readings in a row agree, so one bad packet
+    # can't fire the shutter. The first confirmed position only sets the
+    # baseline -- booting with a switch already up mustn't count as a flip.
+    def __init__(self, channel, high_us=1700, low_us=1300, confirm=3,
+                 min_us=800, max_us=2200):
         self.index = channel - 1
         self.high_us = high_us
         self.low_us = low_us
+        self.confirm = confirm
+        self.min_us = min_us
+        self.max_us = max_us
         self.state = None
+        self._pending = None
+        self._count = 0
 
     def update(self, channels):
         pwm = channels[self.index]
-        # 0 = channel unused, 65535 = invalid (MAVLink RC_CHANNELS spec).
-        if pwm == 0 or pwm == 65535:
-            return None
-        if pwm >= self.high_us:
+        # 0 = channel unused, 65535 = invalid (MAVLink RC_CHANNELS spec);
+        # anything else outside a real servo pulse range is garbage too.
+        # Mid-stick readings are ambiguous. All of these break the run.
+        if pwm < self.min_us or pwm > self.max_us:
+            new = None
+        elif pwm >= self.high_us:
             new = True
         elif pwm <= self.low_us:
             new = False
         else:
+            new = None
+        if new is None or new == self.state:
+            self._pending = None
+            self._count = 0
             return None
-        if self.state is None:
-            self.state = new
+        if new != self._pending:
+            self._pending = new
+            self._count = 0
+        self._count += 1
+        if self._count < self.confirm:
             return None
-        if new == self.state:
-            return None
+        self._pending = None
+        self._count = 0
+        baseline = self.state is None
         self.state = new
-        return new
+        return None if baseline else new

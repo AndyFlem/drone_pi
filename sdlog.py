@@ -25,6 +25,7 @@ class TlogWriter:
         self._file = open(self._path, "wb")
         self._sync_interval_ms = sync_interval_ms
         self._last_sync = time.ticks_ms()
+        self.max_sync_us = 0  # worst flush+sync since main last read/reset it
 
     def _next_session_id(self):
         existing = {f for f in os.listdir(self.mount_point) if f.startswith("log") and f.endswith(".tlog")}
@@ -43,8 +44,12 @@ class TlogWriter:
 
         now = self._time.ticks_ms()
         if self._time.ticks_diff(now, self._last_sync) >= self._sync_interval_ms:
+            t0 = self._time.ticks_us()
             self._file.flush()
             os.sync()
+            d = self._time.ticks_diff(self._time.ticks_us(), t0)
+            if d > self.max_sync_us:
+                self.max_sync_us = d
             self._last_sync = now
 
     def close(self):
@@ -64,6 +69,7 @@ class TextLogWriter:
         self._file = open(self._path, "a")
         self._sync_interval_ms = sync_interval_ms
         self._last_sync = time.ticks_ms()
+        self.max_sync_us = 0
 
     @property
     def path(self):
@@ -74,8 +80,12 @@ class TextLogWriter:
 
         now = self._time.ticks_ms()
         if self._time.ticks_diff(now, self._last_sync) >= self._sync_interval_ms:
+            t0 = self._time.ticks_us()
             self._file.flush()
             os.sync()
+            d = self._time.ticks_diff(self._time.ticks_us(), t0)
+            if d > self.max_sync_us:
+                self.max_sync_us = d
             self._last_sync = now
 
     def close(self):

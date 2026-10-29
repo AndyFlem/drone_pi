@@ -20,8 +20,9 @@ import time
 from machine import UART, Pin
 
 import config
-from mavlink_min import FrameReader, build_heartbeat, build_set_message_interval, decode
-from util import WallClock
+from mavlink_min import (FrameReader, build_heartbeat, build_set_message_interval, decode,
+                         MAV_TYPE_GCS, MAV_AUTOPILOT_INVALID)
+from util import WallClock, LoopProfiler
 from sdlog import TlogWriter, TextLogWriter
 from wifi_telem import TelemetryLink
 from lora_link import LoraLink
@@ -97,9 +98,11 @@ def _start_display():
     if config.DISPLAY_TYPE == "st7789":
         from lcd_status import StatusDisplay
         return StatusDisplay(config.DISPLAY_SCK_PIN, config.DISPLAY_MOSI_PIN,
-                             config.DISPLAY_MISO_PIN, config.DISPLAY_DC_PIN,
-                             config.DISPLAY_RST_PIN, bl=config.DISPLAY_BL_PIN,
-                             rotation=config.DISPLAY_ROTATION)
+                             config.DISPLAY_DC_PIN, config.DISPLAY_RST_PIN,
+                             bl=config.DISPLAY_BL_PIN,
+                             rotation=config.DISPLAY_ROTATION,
+                             pio_sm=config.DISPLAY_PIO_SM,
+                             baudrate=config.DISPLAY_SPI_BAUD)
     from oled_status import StatusDisplay
     return StatusDisplay(config.I2C_ID, config.I2C_SDA_PIN, config.I2C_SCL_PIN,
                          addr=config.OLED_ADDR)
@@ -124,7 +127,7 @@ def main():
         "uart0 (mavlink)",
         lambda: UART(config.UART_ID, baudrate=config.UART_BAUD,
                       tx=Pin(config.UART_TX_PIN), rx=Pin(config.UART_RX_PIN),
-                      rxbuf=1024),
+                      rxbuf=config.UART_RXBUF),
     )
     reader = FrameReader(uart)
     clock = WallClock()
@@ -147,6 +150,7 @@ def main():
         lora = None
 
     log("[init] sd card + tlog ...")
+    text_log = None
     try:
         tlog = TlogWriter(config.SPI_ID, config.SPI_SCK_PIN, config.SPI_MOSI_PIN,
                            config.SPI_MISO_PIN, config.SD_CS_PIN,
@@ -162,6 +166,7 @@ def main():
             # Debug/flight-event log is a nice-to-have alongside the .tlog --
             # its absence shouldn't take down telemetry logging either.
             log("[init] text log FAILED: %r -- REPL-only debug output" % e)
+            text_log = None
     except Exception as e:
         # SD card/adapter not wired in yet (or faulty) -- keep flying blind on
         # logging rather than bricking the status display over it.
@@ -180,8 +185,11 @@ def main():
         lambda: CameraRemote(config.CAMERA_PHOTO_PIN, config.CAMERA_VIDEO_PIN,
                              press_ms=config.CAMERA_PRESS_MS, gap_ms=config.CAMERA_GAP_MS),
     )
-    video_switch = RcSwitch(config.CAMERA_VIDEO_RC_CHAN) if config.CAMERA_VIDEO_RC_CHAN else None
-    photo_switch = RcSwitch(config.CAMERA_PHOTO_RC_CHAN) if config.CAMERA_PHOTO_RC_CHAN else None
+    confirm = config.CAMERA_RC_CONFIRM_READS
+    video_switch = (RcSwitch(config.CAMERA_VIDEO_RC_CHAN, confirm=confirm)
+                    if config.CAMERA_VIDEO_RC_CHAN else None)
+    photo_switch = (RcSwitch(config.CAMERA_PHOTO_RC_CHAN, confirm=confirm)
+                    if config.CAMERA_PHOTO_RC_CHAN else None)
 
     log("=== entering main loop ===")
 
@@ -201,28 +209,61 @@ def main():
     last_stations = time.ticks_ms()
     last_summary = time.ticks_ms()
     last_lora_stats = time.ticks_ms()
+    last_loop_stats = time.ticks_ms()
     last_request = 0  # force an immediate request as soon as we know the FC's ids
+    # Worst-case time per loop section, logged as a [loop] line -- anything
+    # longer than rxbuf / (baud/10) (about 11 ms for 1 KB at 921600) can
+    # overflow the UART RX buffer if the FC is sending flat out.
+    prof = LoopProfiler()
+    last_crc_fail = 0
+    last_resync = 0
+    last_bytes_in = 0
 
     while True:
+        t_loop = prof.start()
         # The LoRa link is polled at several points per iteration, not just
         # once: after a transmit it has to be back in RX within a few ms to
         # catch the ground reply, and an SD sync or display push can block for
         # longer than that.
         if lora is not None:
+            t = prof.start()
             lora.poll()
+            prof.stop("lora_poll", t)
 
-        for frame in reader.poll():
+        t = prof.start()
+        frames = reader.poll()
+        prof.stop("rx", t)
+
+        t_frames = prof.start()
+        for frame in frames:
             if tlog is not None:
+                t = prof.start()
                 tlog.write_frame(frame, clock.now())
+                prof.stop("tlog", t)
             frame_count += 1
 
             msgid, fields = decode(frame)
             if msgid not in config.WIFI_EXCLUDE_MSGIDS:
+                t = prof.start()
                 link.send(frame)
+                prof.stop("wifi", t)
             if lora is not None and not _is_own_ack(msgid, fields):
+                t = prof.start()
                 lora.offer(frame, msgid)
-            if msgid == 0:
+                prof.stop("lora_offer", t)
+            # Lock onto the first autopilot heartbeat's ids and keep them --
+            # a GCS, radio or companion heartbeat (or a corrupt one) must not
+            # retarget our requests or drive mode/arm events. Once locked,
+            # decoded fields from any other source are ignored (the frame
+            # itself has already been logged and relayed above).
+            if (msgid == 0 and fc_sysid is None and fields
+                    and fields["type"] != MAV_TYPE_GCS
+                    and fields["autopilot"] != MAV_AUTOPILOT_INVALID):
                 fc_sysid, fc_compid = frame[5], frame[6]
+                log("[flight] FC is sysid %d compid %d" % (fc_sysid, fc_compid))
+            if fields and (frame[5], frame[6]) != (fc_sysid, fc_compid) and (
+                    msgid == 0 or fc_sysid is not None):
+                fields = None
             if msgid == 2 and fields and fields["time_unix_usec"]:
                 was_synced = clock.synced
                 clock.sync(fields["time_unix_usec"])
@@ -267,16 +308,22 @@ def main():
                     last_position = fields
                 elif msgid == 30:
                     last_attitude = fields
+        prof.stop("frames", t_frames)
 
         if lora is not None:
+            t = prof.start()
             lora.poll()
+            prof.stop("lora_poll", t)
         camera.poll()
 
+        t = prof.start()
         for cmd in link.poll_commands():
             uart.write(cmd)
+        prof.stop("gcs_cmd", t)
 
         now = time.ticks_ms()
 
+        t = prof.start()
         if time.ticks_diff(now, last_heartbeat) >= config.HEARTBEAT_INTERVAL_MS:
             uart.write(build_heartbeat(heartbeat_seq))
             heartbeat_seq = (heartbeat_seq + 1) & 0xFF
@@ -288,24 +335,53 @@ def main():
                     request_seq, fc_sysid, fc_compid, wanted_id, interval_us))
                 request_seq = (request_seq + 1) & 0xFF
             last_request = now
+        prof.stop("uart_tx", t)
 
         if time.ticks_diff(now, last_display) >= config.DISPLAY_UPDATE_INTERVAL_MS:
+            t = prof.start()
             display.update(frames=frame_count, uptime_s=time.ticks_diff(now, boot_ms) // 1000,
                            lora_rssi=lora.rssi if lora is not None else None)
             display.render()
+            prof.stop("display", t)
             last_display = now
             if lora is not None:
+                t = prof.start()
                 lora.poll()
+                prof.stop("lora_poll", t)
 
         if lora is not None and time.ticks_diff(now, last_lora_stats) >= config.LORA_STATS_INTERVAL_MS:
+            t = prof.start()
             log("[lora] " + lora.stats())
+            prof.stop("log", t)
             last_lora_stats = now
 
         if time.ticks_diff(now, last_stations) >= config.STATION_CHECK_INTERVAL_MS:
+            t = prof.start()
             link.check_stations()
+            prof.stop("stations", t)
             last_stations = now
 
+        if time.ticks_diff(now, last_loop_stats) >= config.LOOP_STATS_INTERVAL_MS:
+            # SD flush+sync times are measured inside sdlog; fold them in here.
+            if tlog is not None:
+                prof.note("tlog_sync", tlog.max_sync_us)
+                tlog.max_sync_us = 0
+            if text_log is not None:
+                prof.note("txt_sync", text_log.max_sync_us)
+                text_log.max_sync_us = 0
+            secs = time.ticks_diff(now, last_loop_stats) / 1000
+            log("[loop] max ms: %s | rx peak %d/%d B, %d B/s, crc_fail +%d, resync +%d" % (
+                prof.report(), reader.peak_waiting, config.UART_RXBUF,
+                (reader.bytes_in - last_bytes_in) / secs,
+                reader.crc_fail_count - last_crc_fail, reader.resync_count - last_resync))
+            reader.peak_waiting = 0
+            last_bytes_in = reader.bytes_in
+            last_crc_fail = reader.crc_fail_count
+            last_resync = reader.resync_count
+            last_loop_stats = now
+
         if time.ticks_diff(now, last_summary) >= config.FLIGHT_SUMMARY_INTERVAL_MS:
+            t = prof.start()
             if last_position is not None and last_attitude is not None:
                 hdg = last_position["hdg_deg"]
                 batt = _battery_text(last_battery)
@@ -314,7 +390,10 @@ def main():
                     last_position["lat_deg"], last_position["lon_deg"], last_position["rel_alt_m"],
                     "%.0f" % hdg if hdg is not None else "?",
                     last_attitude["roll_deg"], last_attitude["pitch_deg"], last_attitude["yaw_deg"]))
+            prof.stop("log", t)
             last_summary = now
+
+        prof.stop("loop", t_loop)
 
 
 if __name__ == "__main__":

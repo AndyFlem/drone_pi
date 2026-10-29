@@ -3,9 +3,12 @@
 # Scope is deliberately narrow: reassemble raw frames off the UART for .tlog
 # logging, decode the handful of fields the OLED/flight-event log needs, and
 # build an outgoing HEARTBEAT so the FC starts/keeps streaming (dronespec.md
-# Sec.5 notes this helps ArduPilot begin sending). We do not validate
-# incoming checksums -- QGroundControl/MAVExplorer will do that when the
-# .tlog is replayed.
+# Sec.5 notes this helps ArduPilot begin sending). Incoming checksums are
+# validated only for the message types decode() understands (CRC_EXTRA
+# below) -- those drive flight-event logging and the camera, so a frame
+# spliced together from dropped UART bytes must never reach them. Everything
+# else passes through unchecked to the .tlog and radio links;
+# QGroundControl/MAVExplorer validate it on replay.
 
 import ustruct as struct
 import math
@@ -18,7 +21,7 @@ _INCOMPAT_SIGNED = 0x01
 
 # Highest real message ID across common.xml + ardupilotmega.xml, with
 # generous headroom. We don't have a CRC_EXTRA table for every message type
-# we might receive, so we can't fully checksum-validate incoming frames --
+# we might receive, so we can't checksum-validate every incoming frame --
 # but a stray 0xFD found inside another message's payload (a false sync)
 # produces effectively random header bytes, which is astronomically unlikely
 # to land under this bound by chance. Anything above it gets treated as a
@@ -32,6 +35,28 @@ _MAX_PLAUSIBLE_MSGID = 16383
 _HEARTBEAT_CRC_EXTRA = 50
 _COMMAND_LONG_CRC_EXTRA = 152
 _RADIO_STATUS_CRC_EXTRA = 185
+
+# CRC_EXTRA for every incoming message decode() handles. FrameReader drops
+# any frame of these types whose checksum fails: unchecked, a frame whose
+# middle was lost to a UART overrun splices one message's header onto
+# another's tail, and decodes as e.g. a DISARMED heartbeat or ch9 = 40000us.
+CRC_EXTRA = {
+    0: 50,     # HEARTBEAT
+    1: 124,    # SYS_STATUS
+    2: 137,    # SYSTEM_TIME
+    24: 24,    # GPS_RAW_INT
+    27: 144,   # RAW_IMU
+    30: 39,    # ATTITUDE
+    33: 104,   # GLOBAL_POSITION_INT
+    65: 118,   # RC_CHANNELS
+    74: 20,    # VFR_HUD
+    77: 143,   # COMMAND_ACK
+    253: 83,   # STATUSTEXT
+}
+
+# HEARTBEAT.type / .autopilot values that mark a sender as not the FC.
+MAV_TYPE_GCS = 6
+MAV_AUTOPILOT_INVALID = 8
 
 # SiK radios report RADIO_STATUS as sysid '3' / compid 'D'; ArduPilot and the
 # GCSs recognise a telemetry radio by these ids.
@@ -129,21 +154,41 @@ class FrameReader:
         self.uart = uart
         self._buf = bytearray()
         self.resync_count = 0
+        self.crc_fail_count = 0
+        # Loop diagnostics: bytes read in total, and the most bytes found
+        # waiting in the UART RX buffer at one poll (reset by the caller).
+        # A peak at the rxbuf size means the buffer filled and bytes were lost.
+        self.bytes_in = 0
+        self.peak_waiting = 0
 
     def poll(self):
         """Call regularly; returns a list of complete raw frames (bytes)."""
         n = self.uart.any()
         if n:
             self._buf.extend(self.uart.read(n))
+            self.bytes_in += n
+            if n > self.peak_waiting:
+                self.peak_waiting = n
         frames = []
         while True:
             frame = self._try_extract()
             if frame is None:
                 break
-            frames.append(frame)
+            if frame is not False:  # False = resynced, keep scanning
+                frames.append(frame)
         return frames
 
+    def _resync(self):
+        # The "total" length came from untrustworthy header bytes, so only
+        # drop the offending STX and resync on the next 0xFD rather than
+        # skipping a whole miscomputed frame length, which could eat a real
+        # frame.
+        self._buf[:1] = b""
+        return False
+
     def _try_extract(self):
+        """A frame (bytes), None if more data is needed, or False after a
+        resync (caller should just try again)."""
         buf = self._buf
         start = buf.find(bytes([MAVLINK2_STX]))
         if start == -1:
@@ -164,13 +209,19 @@ class FrameReader:
 
         msgid = buf[7] | (buf[8] << 8) | (buf[9] << 16)
         if msgid > _MAX_PLAUSIBLE_MSGID:
-            # False sync -- this "total" length is untrustworthy too (it was
-            # read from bogus header bytes), so only drop the offending STX
-            # and resync on the next 0xFD rather than skipping a whole
-            # miscomputed frame length, which could eat a real frame.
+            # False sync.
             self.resync_count += 1
-            buf[:1] = b""
-            return None
+            return self._resync()
+
+        crc_extra = CRC_EXTRA.get(msgid)
+        if crc_extra is not None:
+            end = _HEADER_LEN + payload_len
+            crc = x25crc(memoryview(buf)[1:end])
+            crc = x25crc(bytes([crc_extra]), crc)
+            if crc != (buf[end] | (buf[end + 1] << 8)):
+                # Corrupt (bytes dropped mid-frame) or a false sync.
+                self.crc_fail_count += 1
+                return self._resync()
 
         frame = bytes(buf[:total])
         buf[:total] = b""
@@ -198,11 +249,10 @@ def decode(frame):
     msgid = frame[7] | (frame[8] << 8) | (frame[9] << 16)
     payload = frame[10:10 + frame[1]]
 
-    # Frames aren't CRC-validated (see module docstring), so a false resync
-    # can hand us a header that looks plausible but whose payload is garbage
-    # (e.g. non-UTF8 bytes where STATUSTEXT expects text). Decoding is
-    # inherently best-effort -- any failure here just means "nothing to
-    # report" for this frame, not a reason to crash the logger.
+    # FrameReader CRC-validates every type decoded here, but decoding stays
+    # best-effort (e.g. a sender putting non-UTF8 bytes in STATUSTEXT) -- any
+    # failure just means "nothing to report" for this frame, not a reason to
+    # crash the logger.
     try:
         if msgid == 0:  # HEARTBEAT
             p = _pad(payload, 9)
@@ -210,6 +260,8 @@ def decode(frame):
             return msgid, {
                 "mode": ARDUCOPTER_MODES.get(custom_mode, str(custom_mode)),
                 "armed": bool(base_mode & _MAV_MODE_FLAG_SAFETY_ARMED),
+                "type": mtype,
+                "autopilot": autopilot,
             }
 
         if msgid == 2:  # SYSTEM_TIME -- time_unix_usec is 0 until the FC has a

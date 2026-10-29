@@ -5,6 +5,9 @@ UART_ID = 0
 UART_TX_PIN = 0
 UART_RX_PIN = 1
 UART_BAUD = 921600
+# bytes; overflows drop frame bytes -- see the [loop] stats line. The FC
+# streams ~2.4 KB/s, so 4 KB rides out a ~1.5 s main-loop stall.
+UART_RXBUF = 4096
 
 # SPI0 (Pico <-> microSD, 3.3V-only mini adapter -- never feed it 5V)
 SPI_ID = 0
@@ -39,11 +42,12 @@ I2C_SDA_PIN = 26
 I2C_SCL_PIN = 27
 OLED_ADDR = 0x3C  # try 0x3D if the screen stays blank
 
-# SoftSPI (Pico <-> ST7789 240x240 IPS, ZJY-IPS130 V2.0). The 7-pin board
+# PIO SPI (Pico <-> ST7789 240x240 IPS, ZJY-IPS130 V2.0). The 7-pin board
 # has no CS, so it gets its own pins rather than sharing SPI0/SPI1.
 DISPLAY_SCK_PIN = 27  # board "SCL"
 DISPLAY_MOSI_PIN = 26  # board "SDA"
-DISPLAY_MISO_PIN = 28  # unconnected -- SoftSPI requires one (GP21 is the camera remote now)
+DISPLAY_PIO_SM = 0  # PIO0 SM0; the cyw43 WiFi driver claims its own on PIO1
+DISPLAY_SPI_BAUD = 20_000_000  # drop to 10 MHz if the screen shows garbage
 DISPLAY_RST_PIN = 8  # board "RES"
 DISPLAY_DC_PIN = 9
 DISPLAY_BL_PIN = 20  # board "BLK"; None if BLK is tied to 3V3
@@ -62,6 +66,10 @@ CAMERA_GAP_MS = 250  # released time between queued presses
 # a momentary button or a 2-pos switch both work.
 CAMERA_VIDEO_RC_CHAN = 7
 CAMERA_PHOTO_RC_CHAN = 9
+# RC_CHANNELS readings in a row (requested at 10 Hz below, so ~300 ms) that
+# must agree before a camera switch move counts -- one packet never fires
+# the camera.
+CAMERA_RC_CONFIRM_READS = 3
 # Also press record on arm and again on disarm. The Pico can't see whether
 # the camera is actually recording, so if this is on, leave the video switch
 # alone while armed or the two will get out of step.
@@ -72,6 +80,10 @@ DISPLAY_UPDATE_INTERVAL_MS = 400
 HEARTBEAT_INTERVAL_MS = 1000
 STATION_CHECK_INTERVAL_MS = 2000  # how often to poll for AP client connect/disconnect
 FLIGHT_SUMMARY_INTERVAL_MS = 5000  # how often to log a position/attitude summary line
+# How often to log a [loop] line: worst-case ms per main-loop section, peak
+# bytes waiting in the UART RX buffer, and dropped/corrupt frame counts --
+# for tracking down the stalls that overflow UART_RXBUF.
+LOOP_STATS_INTERVAL_MS = 5000
 
 # Messages requested explicitly via MAV_CMD_SET_MESSAGE_INTERVAL, since this
 # port has no SRx_* stream-rate group of its own (see mavlink_min.
